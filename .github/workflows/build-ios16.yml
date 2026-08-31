@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v4 runtime-state fix)
+name: Build ARMSX2 for iOS 16 (compat v5 targeted runtime-state fix)
 
 on:
   workflow_dispatch:
@@ -206,7 +206,7 @@ jobs:
               print('NOTE: expected classes not seen in this checkout:', ', '.join(sorted(missing)))
           PY
 
-      - name: Repair ObservableObject consumers for iOS 16 runtime navigation
+      - name: Repair only AppState observation for iOS 16 navigation
         shell: bash
         run: |
           python3 - <<'PY'
@@ -214,164 +214,77 @@ jobs:
           import re
 
           root = Path('platforms/ios/app/src/main/swift')
-          observable_classes = {
-              'AppState',
-              'FileImportHandler',
-              'CoverStore',
-              'DynamicThumbstickSettings',
-              'EmulatorBridge',
-              'SettingsStore',
-              'ExternalGameLibrary',
-              'PatchStore',
-              'FrameTimeDynamicResolutionController',
-              'InitialContentBootstrap',
-              'VPadSkinLibraryStore',
-              'PadLayoutPresetStore',
-              'PadLayoutStore',
-              'DynamicCrosshairRuntimeState',
-          }
+          views = root / 'Views'
 
-          # Why this pass exists:
-          # iOS 17 Observation can track a plain stored reference such as:
-          #     let appState: AppState
-          # inside a SwiftUI View. After backporting AppState to ObservableObject on
-          # iOS 16, that plain reference is NOT observed. The VM can therefore start
-          # (audio runs) while RootView remains visually stuck on the library because
-          # currentScreen changes do not invalidate the SwiftUI body.
-          #
-          # Convert direct View-held references to @ObservedObject, and View-owned
-          # @State references to @StateObject. This restores the invalidation semantics
-          # that upstream gets automatically from @Observable on iOS 17.
+          # V4 tried to infer every ObservableObject consumer and was intentionally
+          # too broad: it wrapped arrays, Strings and computed properties. V5 goes
+          # back to the compile-proven V3 baseline and changes ONLY AppState
+          # references in the three navigation/game views involved in the transition.
+          targets = [
+              views / 'RootView.swift',
+              views / 'GameListView.swift',
+              views / 'GameScreenView.swift',
+          ]
 
-          cls_alt = '|'.join(sorted(map(re.escape, observable_classes), key=len, reverse=True))
-          type_ref = re.compile(r':\s*(?:' + cls_alt + r')\b')
-          init_ref = re.compile(r'=\s*(?:' + cls_alt + r')\s*(?:\(|\.)')
-          prop_decl = re.compile(
-              r'^(?P<indent>\s*)'
-              r'(?P<attrs>(?:@[A-Za-z_][A-Za-z0-9_]*(?:\([^\n]*\))?\s+)*)'
-              r'(?P<mods>(?:(?:private|fileprivate|internal|public|package|nonisolated)\s+)*)'
-              r'(?P<kind>let|var)\s+'
-              r'(?P<rest>[A-Za-z_][A-Za-z0-9_]*.*)$'
+          # Exact stored-property form only. This cannot match function parameters,
+          # arrays, computed properties or unrelated model types.
+          prop = re.compile(
+              r'^(?P<indent>\\s*)'
+              r'(?P<mods>(?:(?:private|fileprivate|internal|public|package|nonisolated)\\s+)*)'
+              r'(?P<kind>let|var)\\s+appState\\s*:\\s*AppState(?P<tail>\\s*(?:=.*)?$)'
           )
 
-          already_observing = ('@ObservedObject', '@StateObject', '@EnvironmentObject')
-          unsuitable_wrappers = ('@Binding', '@Environment(', '@Environment\\(')
-          total_observed = 0
-          total_stateobject = 0
-          details = []
-
-          def brace_delta(line: str) -> int:
-              # Swift source in these declarations is simple enough for structural scanning.
-              # Ignore braces after // so comments do not perturb nesting.
-              code = line.split('//', 1)[0]
-              return code.count('{') - code.count('}')
-
-          for path in root.rglob('*.swift'):
-              original = path.read_text()
-              lines = original.splitlines()
-              out = list(lines)
-              depth = 0
-              # Body depths for nested SwiftUI View structs/classes.
-              view_body_depths = []
-
-              # First pass also records a standalone @State line immediately before
-              # a model property, a style used in a few Swift files.
-              pending_state_annotation = None
-
-              for i, line in enumerate(lines):
-                  stripped = line.strip()
-
-                  # Pop View scopes that ended on the previous line.
-                  while view_body_depths and depth < view_body_depths[-1]:
-                      view_body_depths.pop()
-
-                  in_direct_view_body = bool(view_body_depths and depth == view_body_depths[-1])
-
-                  if in_direct_view_body and stripped == '@State':
-                      pending_state_annotation = i
-                  elif in_direct_view_body:
-                      m = prop_decl.match(line)
-                      if m:
-                          refs_model = bool(type_ref.search(line) or init_ref.search(line))
-                          if refs_model:
-                              attrs = m.group('attrs') or ''
-                              if pending_state_annotation is not None:
-                                  # @State on its own line -> @StateObject.
-                                  out[pending_state_annotation] = out[pending_state_annotation].replace('@State', '@StateObject', 1)
-                                  total_stateobject += 1
-                                  details.append(f'{path}:{pending_state_annotation+1} standalone @State -> @StateObject')
-                                  pending_state_annotation = None
-                              elif '@State' in attrs and '@StateObject' not in attrs:
-                                  out[i] = line.replace('@State', '@StateObject', 1)
-                                  total_stateobject += 1
-                                  details.append(f'{path}:{i+1} @State -> @StateObject')
-                              elif not any(w in attrs for w in already_observing) and not any(w in attrs for w in unsuitable_wrappers):
-                                  # Plain Observation reference. ObservableObject requires an
-                                  # explicit SwiftUI observer wrapper on iOS 16.
-                                  indent = m.group('indent')
-                                  mods = m.group('mods') or ''
-                                  rest = m.group('rest')
-                                  # Property wrappers require var, not let.
-                                  out[i] = f'{indent}@ObservedObject {mods}var {rest}'
-                                  total_observed += 1
-                                  details.append(f'{path}:{i+1} plain model reference -> @ObservedObject')
-                          else:
-                              pending_state_annotation = None
-                      elif stripped and not stripped.startswith('@'):
-                          pending_state_annotation = None
-
-                  # Detect a View declaration. Handle common `struct Foo: View {` and
-                  # `private struct Foo: View {` forms. The direct body is depth+1.
-                  code = line.split('//', 1)[0]
-                  if re.search(r'\b(?:struct|class)\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*<[^>]+>)?\s*:[^{]*\bView\b[^{]*\{', code):
-                      view_body_depths.append(depth + 1)
-
-                  depth += brace_delta(line)
-                  while view_body_depths and depth < view_body_depths[-1]:
-                      view_body_depths.pop()
-
-              text = '\n'.join(out) + ('\n' if original.endswith('\n') else '')
-              if text != original:
-                  path.write_text(text)
-
-          # Critical route assertion: the menu/game switch must itself publish.
-          app_state_path = root / 'Models' / 'AppState.swift'
-          if app_state_path.exists():
-              lines = app_state_path.read_text().splitlines()
-              found_current_screen = False
-              changed_current_screen = False
-              for i, line in enumerate(lines):
-                  if re.search(r'\bvar\s+currentScreen\b', line):
-                      found_current_screen = True
-                      if '@Published' not in line:
-                          indent = line[:len(line) - len(line.lstrip())]
-                          lines[i] = indent + '@Published ' + line.lstrip()
-                          changed_current_screen = True
-                          details.append(f'{app_state_path}:{i+1} forced currentScreen @Published')
-              if found_current_screen:
-                  app_state_path.write_text('\n'.join(lines) + '\n')
-                  if changed_current_screen:
-                      print('Forced AppState.currentScreen to @Published')
-                  else:
-                      print('Verified AppState.currentScreen is @Published')
-              else:
-                  print('WARNING: AppState.currentScreen declaration not found by exact name; upstream route shape may have changed.')
-
-          print(f'View plain-model references converted to @ObservedObject: {total_observed}')
-          print(f'View @State model references converted to @StateObject: {total_stateobject}')
-          for d in details:
-              print('  ' + d)
-
-          # Runtime-navigation diagnostics. These do not fail the build; they make the
-          # Action log tell us immediately if another unobserved AppState reference remains.
-          print('\nRemaining AppState references in RootView/GameListView/GameScreenView:')
-          for name in ('RootView.swift', 'GameListView.swift', 'GameScreenView.swift'):
-              p = root / 'Views' / name
-              if not p.exists():
+          changes = []
+          for path in targets:
+              if not path.exists():
+                  print(f'NOTE: {path} does not exist in this checkout')
                   continue
-              for n, line in enumerate(p.read_text().splitlines(), 1):
+              lines = path.read_text().splitlines()
+              for i, line in enumerate(lines):
+                  # Already observed (for example if upstream changed it) => leave it.
+                  if '@ObservedObject' in line or '@StateObject' in line or '@EnvironmentObject' in line:
+                      continue
+                  m = prop.match(line)
+                  if not m:
+                      continue
+                  # Property wrappers require var.
+                  lines[i] = f"{m.group('indent')}@ObservedObject {m.group('mods')}var appState: AppState{m.group('tail')}"
+                  changes.append(f'{path}:{i+1}: {line.strip()} -> {lines[i].strip()}')
+              path.write_text('\\n'.join(lines) + '\\n')
+
+          # AppState was converted from @Observable to ObservableObject by the V3 pass.
+          # Ensure the route field which selects library vs game view actually emits.
+          app_state_candidates = list(root.rglob('AppState.swift'))
+          if not app_state_candidates:
+              raise SystemExit('AppState.swift not found')
+          app_state = app_state_candidates[0]
+          lines = app_state.read_text().splitlines()
+          route_hits = 0
+          for i, line in enumerate(lines):
+              if re.search(r'\\bvar\\s+currentScreen\\b', line):
+                  route_hits += 1
+                  if '@Published' not in line:
+                      indent = line[:len(line)-len(line.lstrip())]
+                      lines[i] = indent + '@Published ' + line.lstrip()
+                      changes.append(f'{app_state}:{i+1}: forced currentScreen @Published')
+          app_state.write_text('\\n'.join(lines) + '\\n')
+
+          print('Targeted iOS 16 AppState observation changes:')
+          if changes:
+              for item in changes:
+                  print('  ' + item)
+          else:
+              print('  none required (upstream may already explicitly observe AppState)')
+          print(f'currentScreen declarations found: {route_hits}')
+
+          # Diagnostic only: show exact AppState wiring in the transition views.
+          print('\\nAppState references after targeted patch:')
+          for path in targets:
+              if not path.exists():
+                  continue
+              for n, line in enumerate(path.read_text().splitlines(), 1):
                   if 'AppState' in line or 'appState' in line or 'currentScreen' in line:
-                      print(f'{p}:{n}: {line}')
+                      print(f'{path}:{n}: {line}')
           PY
 
       - name: Add iOS 16 SwiftUI compatibility helpers
@@ -604,7 +517,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v4
+          name: ARMSX2-iOS16-unsigned-v5
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -612,12 +525,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v4
+          name: ARMSX2-iOS16-build-log-v5
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 compatibility/runtime-state pass reached another blocker. Download ARMSX2-iOS16-build-log-v4 and inspect the first real error.' >&2
+          echo 'The iOS 16 V5 targeted compatibility pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v5 and inspect the first real error.' >&2
           exit 1
