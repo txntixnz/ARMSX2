@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v2)
+name: Build ARMSX2 for iOS 16 (compat v3)
 
 on:
   workflow_dispatch:
@@ -240,13 +240,16 @@ jobs:
           }
 
           // iOS 17 ContentUnavailableView replacement used by ARMSX2 on iOS 16.
-          struct IOS16ContentUnavailableView<Description: View>: View {
-              let title: LocalizedStringKey
+          // The upstream convenience initializer accepts a StringProtocol title and an
+          // optional Text description. Keep that call shape so dynamic localized Strings
+          // (SettingsStore.localized(...)) compile on iOS 16 as well.
+          struct IOS16ContentUnavailableView: View {
+              let title: String
               let systemImage: String
-              @ViewBuilder let description: () -> Description
+              let description: Text?
 
-              init(_ title: LocalizedStringKey, systemImage: String, @ViewBuilder description: @escaping () -> Description) {
-                  self.title = title
+              init<S: StringProtocol>(_ title: S, systemImage: String, description: Text? = nil) {
+                  self.title = String(title)
                   self.systemImage = systemImage
                   self.description = description
               }
@@ -257,9 +260,11 @@ jobs:
                           .font(.system(size: 34, weight: .semibold))
                       Text(title)
                           .font(.headline)
-                      description()
-                          .font(.subheadline)
-                          .multilineTextAlignment(.center)
+                      if let description {
+                          description
+                              .font(.subheadline)
+                              .multilineTextAlignment(.center)
+                      }
                   }
                   .padding()
               }
@@ -338,7 +343,7 @@ jobs:
                       counts[a] = counts.get(a, 0) + n
 
               # These modifiers are cosmetic and unavailable on iOS 16.0. Removing them preserves core behavior.
-              for member in ('contentMargins', 'scrollBounceBehavior', 'symbolEffect', 'contentTransition', 'presentationBackground'):
+              for member in ('contentMargins', 'scrollBounceBehavior', 'symbolEffect', 'contentTransition', 'presentationBackground', 'presentationCornerRadius'):
                   text, n = strip_member_call(text, member)
                   if n:
                       counts[member] = counts.get(member, 0) + n
@@ -358,6 +363,37 @@ jobs:
                   text = re.sub(r'\b([A-Za-z_][A-Za-z0-9_]*)\.magnification\b', r'\1', text)
                   counts['MagnifyGesture'] = counts.get('MagnifyGesture', 0) + n
 
+              # iOS 17 allows chaining Shape.fill(...).stroke(...). On iOS 16 the
+              # filled result is a View, so the following .stroke resolves to the newer
+              # View API and fails availability checking. Preserve the visual by putting
+              # the stroke in an overlay of the same shape.
+              lines = text.splitlines()
+              fixed_lines = []
+              i = 0
+              shape_chain_fixes = 0
+              while i < len(lines):
+                  if i + 2 < len(lines):
+                      base = lines[i].strip()
+                      fill = lines[i + 1].lstrip()
+                      stroke = lines[i + 2].lstrip()
+                      simple_shape = bool(re.match(r'^[A-Za-z_][A-Za-z0-9_\.]*\(.*\)$', base))
+                      simple_name = bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', base))
+                      if (simple_shape or simple_name) and fill.startswith('.fill(') and stroke.startswith('.stroke('):
+                          fill_indent = lines[i + 1][:len(lines[i + 1]) - len(lines[i + 1].lstrip())]
+                          fixed_lines.append(lines[i])
+                          fixed_lines.append(lines[i + 1])
+                          fixed_lines.append(fill_indent + '.overlay(')
+                          fixed_lines.append(fill_indent + '    ' + base + stroke)
+                          fixed_lines.append(fill_indent + ')')
+                          i += 3
+                          shape_chain_fixes += 1
+                          continue
+                  fixed_lines.append(lines[i])
+                  i += 1
+              if shape_chain_fixes:
+                  text = '\n'.join(fixed_lines) + ('\n' if text.endswith('\n') else '')
+                  counts['fill+stroke overlays'] = counts.get('fill+stroke overlays', 0) + shape_chain_fixes
+
               path.write_text(text)
 
           print('SwiftUI compatibility rewrites:')
@@ -369,7 +405,7 @@ jobs:
         shell: bash
         run: |
           echo 'Remaining explicit Observation / iOS17 markers (diagnostic only):'
-          grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(' platforms/ios/app/src/main/swift || true
+          grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(|\.presentationCornerRadius\(' platforms/ios/app/src/main/swift || true
 
       - name: Build unsigned iOS 16 IPA
         id: build
@@ -400,7 +436,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v2
+          name: ARMSX2-iOS16-unsigned-v3
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -408,12 +444,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v2
+          name: ARMSX2-iOS16-build-log-v3
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 compatibility pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v2 and inspect the first real error.' >&2
+          echo 'The iOS 16 compatibility pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v3 and inspect the first real error.' >&2
           exit 1
