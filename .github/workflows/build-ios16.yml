@@ -1,0 +1,82 @@
+name: Build ARMSX2 for iOS 16
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios16:
+    name: iOS 16 unsigned IPA
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout ARMSX2
+        uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Lower deployment target to iOS 16.0
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('platforms/ios/app/src/main/cpp/CMakeLists.txt')
+          s = p.read_text()
+          old = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS deployment target")'
+          new = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS deployment target")'
+          if old not in s:
+              raise SystemExit('Expected iOS 17.0 deployment-target line was not found; upstream changed. Refusing a blind patch.')
+          p.write_text(s.replace(old, new, 1))
+          print('Patched ARMSX2_IOS_DEPLOYMENT_TARGET to 16.0')
+          PY
+          grep -n 'ARMSX2_IOS_DEPLOYMENT_TARGET' platforms/ios/app/src/main/cpp/CMakeLists.txt
+
+      - name: Build unsigned iOS 16 IPA
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          rm -rf platforms/ios/build-ios-xcode
+          ./platforms/ios/scripts/build-ios-ipa.sh
+
+      - name: Verify deployment target
+        if: steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          APP='platforms/ios/build-ios-xcode/Release-iphoneos/ARMSX2iOS.app'
+          BIN="$APP/ARMSX2iOS"
+          echo 'Info.plist MinimumOSVersion:'
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
+          echo
+          echo 'Mach-O build version:'
+          xcrun vtool -show-build "$BIN"
+          echo
+          if ! xcrun vtool -show-build "$BIN" | grep -Eq 'minos[[:space:]]+16(\.0+)?'; then
+            echo 'ERROR: Mach-O executable does not report iOS 16.x as minos.' >&2
+            exit 1
+          fi
+
+      - name: Upload IPA
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX2-iOS16-unsigned
+          path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX2-iOS16-build-log
+          path: platforms/ios/build-ios-xcode/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Fail if the iOS 16 source build failed
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo 'The source does not currently build cleanly for iOS 16. Check the uploaded xcodebuild log for the first availability/linker error.' >&2
+          exit 1
