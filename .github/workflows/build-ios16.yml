@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v5 targeted runtime-state fix)
+name: Build ARMSX2 for iOS 16 (compat v6 Observation singleton fix)
 
 on:
   workflow_dispatch:
@@ -180,6 +180,7 @@ jobs:
           # 2) SwiftUI bindings: @Bindable is iOS 17. @ObservedObject works with converted SettingsStore.
           bindable_replacements = 0
           stateobject_replacements = 0
+          shared_observer_replacements = 0
           for path in root.rglob('*.swift'):
               text = path.read_text()
               n = text.count('@Bindable')
@@ -195,18 +196,37 @@ jobs:
                   pat = re.compile(r'@State(?P<mods>\s+(?:(?:private|fileprivate|internal|public)\s+)?)var(?P<body>\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*' + re.escape(cls) + r')?\s*=\s*' + re.escape(cls) + r'\s*\()')
                   text, c = pat.subn(lambda m: '@StateObject' + (m.group('mods') or ' ') + 'var' + m.group('body'), text)
                   stateobject_replacements += c
+
+                  # iOS 17's Observation framework supports `@State var model = Model.shared`
+                  # and automatically tracks changes inside that @Observable reference.
+                  # Once Model is backported to ObservableObject for iOS 16, @State only
+                  # tracks replacement of the reference and does NOT subscribe to objectWillChange.
+                  # This is exactly the menu->game symptom seen in the field: the VM starts and
+                  # audio runs, but SwiftUI never redraws RootView to present gameplay.
+                  # For singleton references, @ObservedObject is the correct iOS 16 equivalent.
+                  shared_pat = re.compile(
+                      r'@State(?P<mods>\s+(?:(?:private|fileprivate|internal|public)\s+)?)'
+                      r'var(?P<body>\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*' + re.escape(cls) + r')?\s*=\s*'
+                      + re.escape(cls) + r'\.shared\b)'
+                  )
+                  text, c = shared_pat.subn(
+                      lambda m: '@ObservedObject' + (m.group('mods') or ' ') + 'var' + m.group('body'),
+                      text
+                  )
+                  shared_observer_replacements += c
               path.write_text(text)
 
           print('Converted @Observable classes:', ', '.join(sorted(set(converted))))
           print('Added @Published to stored properties:', published)
           print('Replaced @Bindable:', bindable_replacements)
           print('Converted direct @State model owners to @StateObject:', stateobject_replacements)
+          print('Converted @State singleton observable refs to @ObservedObject:', shared_observer_replacements)
           missing = observable_classes - set(converted)
           if missing:
               print('NOTE: expected classes not seen in this checkout:', ', '.join(sorted(missing)))
           PY
 
-      - name: Repair only AppState observation for iOS 16 navigation
+      - name: Verify iOS 16 Observation wiring
         shell: bash
         run: |
           python3 - <<'PY'
@@ -214,77 +234,40 @@ jobs:
           import re
 
           root = Path('platforms/ios/app/src/main/swift')
-          views = root / 'Views'
+          problems = []
+          interesting = []
 
-          # V4 tried to infer every ObservableObject consumer and was intentionally
-          # too broad: it wrapped arrays, Strings and computed properties. V5 goes
-          # back to the compile-proven V3 baseline and changes ONLY AppState
-          # references in the three navigation/game views involved in the transition.
-          targets = [
-              views / 'RootView.swift',
-              views / 'GameListView.swift',
-              views / 'GameScreenView.swift',
-          ]
+          for path in root.rglob('*.swift'):
+              text = path.read_text()
+              # AppState is the route source of truth. It must have been converted to
+              # ObservableObject and the currentScreen route must publish on iOS 16.
+              if path.name == 'AppState.swift':
+                  if 'ObservableObject' not in text:
+                      problems.append('AppState.swift is not ObservableObject')
+                  if not re.search(r'@Published\s+[^\n]*\bvar\s+currentScreen\b', text):
+                      problems.append('AppState.currentScreen is not @Published')
 
-          # Exact stored-property form only. This cannot match function parameters,
-          # arrays, computed properties or unrelated model types.
-          prop = re.compile(
-              r'^(?P<indent>\\s*)'
-              r'(?P<mods>(?:(?:private|fileprivate|internal|public|package|nonisolated)\\s+)*)'
-              r'(?P<kind>let|var)\\s+appState\\s*:\\s*AppState(?P<tail>\\s*(?:=.*)?$)'
-          )
+              # Any leftover Observation-style @State singleton ref would not subscribe
+              # to ObservableObject.objectWillChange on iOS 16.
+              for n, line in enumerate(text.splitlines(), 1):
+                  if re.search(r'@State\b[^\n]*=\s*(?:AppState|SettingsStore|DynamicThumbstickSettings|EmulatorBridge|ExternalGameLibrary|PatchStore|FrameTimeDynamicResolutionController|InitialContentBootstrap|VPadSkinLibraryStore|PadLayoutPresetStore|PadLayoutStore|CoverStore|FileImportHandler)\.shared\b', line):
+                      problems.append(f'{path}:{n}: unconverted singleton @State: {line.strip()}')
+                  if 'AppState.shared' in line and ('@ObservedObject' in line or '@StateObject' in line):
+                      interesting.append(f'{path}:{n}: {line.strip()}')
 
-          changes = []
-          for path in targets:
-              if not path.exists():
-                  print(f'NOTE: {path} does not exist in this checkout')
-                  continue
-              lines = path.read_text().splitlines()
-              for i, line in enumerate(lines):
-                  # Already observed (for example if upstream changed it) => leave it.
-                  if '@ObservedObject' in line or '@StateObject' in line or '@EnvironmentObject' in line:
-                      continue
-                  m = prop.match(line)
-                  if not m:
-                      continue
-                  # Property wrappers require var.
-                  lines[i] = f"{m.group('indent')}@ObservedObject {m.group('mods')}var appState: AppState{m.group('tail')}"
-                  changes.append(f'{path}:{i+1}: {line.strip()} -> {lines[i].strip()}')
-              path.write_text('\\n'.join(lines) + '\\n')
-
-          # AppState was converted from @Observable to ObservableObject by the V3 pass.
-          # Ensure the route field which selects library vs game view actually emits.
-          app_state_candidates = list(root.rglob('AppState.swift'))
-          if not app_state_candidates:
-              raise SystemExit('AppState.swift not found')
-          app_state = app_state_candidates[0]
-          lines = app_state.read_text().splitlines()
-          route_hits = 0
-          for i, line in enumerate(lines):
-              if re.search(r'\\bvar\\s+currentScreen\\b', line):
-                  route_hits += 1
-                  if '@Published' not in line:
-                      indent = line[:len(line)-len(line.lstrip())]
-                      lines[i] = indent + '@Published ' + line.lstrip()
-                      changes.append(f'{app_state}:{i+1}: forced currentScreen @Published')
-          app_state.write_text('\\n'.join(lines) + '\\n')
-
-          print('Targeted iOS 16 AppState observation changes:')
-          if changes:
-              for item in changes:
+          print('Observed AppState singleton wiring after iOS 16 backport:')
+          if interesting:
+              for item in interesting:
                   print('  ' + item)
           else:
-              print('  none required (upstream may already explicitly observe AppState)')
-          print(f'currentScreen declarations found: {route_hits}')
+              print('  (no wrapped AppState.shared properties found)')
 
-          # Diagnostic only: show exact AppState wiring in the transition views.
-          print('\\nAppState references after targeted patch:')
-          for path in targets:
-              if not path.exists():
-                  continue
-              for n, line in enumerate(path.read_text().splitlines(), 1):
-                  if 'AppState' in line or 'appState' in line or 'currentScreen' in line:
-                      print(f'{path}:{n}: {line}')
+          if problems:
+              print('\nERROR: Observation backport verification failed:')
+              for p in problems:
+                  print('  ' + p)
+              raise SystemExit(1)
+          print('iOS 16 Observation wiring verification passed.')
           PY
 
       - name: Add iOS 16 SwiftUI compatibility helpers
@@ -517,7 +500,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v5
+          name: ARMSX2-iOS16-unsigned-v6
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -525,12 +508,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v5
+          name: ARMSX2-iOS16-build-log-v6
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V5 targeted compatibility pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v5 and inspect the first real error.' >&2
+          echo 'The iOS 16 V6 Observation-singleton pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v6 and inspect the first real error.' >&2
           exit 1
