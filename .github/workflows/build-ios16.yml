@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16
+name: Build ARMSX2 for iOS 16 (compat v2)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   ios16:
-    name: iOS 16 unsigned IPA
+    name: iOS 16 compatibility build
     runs-on: macos-26
 
     steps:
@@ -18,21 +18,358 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -switch /Applications/Xcode.app
 
-      - name: Lower deployment target to iOS 16.0
+      - name: Patch deployment target and iOS 17 Swift Observation
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('platforms/ios/app/src/main/cpp/CMakeLists.txt')
-          s = p.read_text()
+          import re
+
+          root = Path('platforms/ios/app/src/main/swift')
+          cmake = Path('platforms/ios/app/src/main/cpp/CMakeLists.txt')
+
+          # 1) Real Mach-O deployment target: iOS 16.0.
+          s = cmake.read_text()
           old = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS deployment target")'
           new = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS deployment target")'
-          if old not in s:
-              raise SystemExit('Expected iOS 17.0 deployment-target line was not found; upstream changed. Refusing a blind patch.')
-          p.write_text(s.replace(old, new, 1))
-          print('Patched ARMSX2_IOS_DEPLOYMENT_TARGET to 16.0')
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise SystemExit('ARMSX2 iOS deployment-target line changed upstream; refusing blind patch.')
+          cmake.write_text(s)
+
+          observable_classes = {
+              'AppState',
+              'FileImportHandler',
+              'CoverStore',
+              'DynamicThumbstickSettings',
+              'EmulatorBridge',
+              'SettingsStore',
+              'ExternalGameLibrary',
+              'PatchStore',
+              'FrameTimeDynamicResolutionController',
+              'InitialContentBootstrap',
+              'VPadSkinLibraryStore',
+              'PadLayoutPresetStore',
+              'PadLayoutStore',
+              'DynamicCrosshairRuntimeState',
+          }
+
+          def brace_delta(line: str) -> int:
+              # Good enough for these Swift declarations; comments/strings are ignored deliberately.
+              return line.count('{') - line.count('}')
+
+          def add_observableobject_conformance(line: str, class_name: str) -> str:
+              if 'ObservableObject' in line:
+                  return line
+              # Only touch the declaration for the class which had @Observable.
+              if not re.search(r'\bclass\s+' + re.escape(class_name) + r'\b', line):
+                  return line
+              brace = line.rfind('{')
+              if brace < 0:
+                  return line
+              head, tail = line[:brace].rstrip(), line[brace:]
+              # Swift inheritance/conformance list.
+              if ':' in head:
+                  head = head.replace(':', ': ObservableObject,', 1)
+              else:
+                  head += ': ObservableObject'
+              return head + ' ' + tail
+
+          def should_publish(line: str, ignored: bool) -> bool:
+              if ignored:
+                  return False
+              stripped = line.strip()
+              if not stripped or stripped.startswith('//') or stripped.startswith('@'):
+                  return False
+              if '@Published' in stripped:
+                  return False
+              if re.search(r'\b(static|class|lazy)\s+var\b', stripped):
+                  return False
+              # Class-level stored vars only. Modifiers such as private(set), nonisolated, etc. are allowed.
+              if not re.match(r'^(?:(?:public|private|fileprivate|internal|package|open|final|nonisolated|isolated|weak|unowned|private\(set\)|public\(set\)|internal\(set\))\s+)*var\s+[A-Za-z_][A-Za-z0-9_]*', stripped):
+                  return False
+              # A declaration with a body and no initializer is computed, not stored.
+              eq = stripped.find('=')
+              br = stripped.find('{')
+              if br >= 0 and (eq < 0 or br < eq):
+                  return False
+              return True
+
+          converted = []
+          published = 0
+
+          for path in root.rglob('*.swift'):
+              original = path.read_text()
+              if '@Observable' not in original and '@ObservationIgnored' not in original:
+                  continue
+
+              lines = original.splitlines()
+              # Locate each @Observable and the immediately following class declaration.
+              targets = []
+              for i, line in enumerate(lines):
+                  if '@Observable' not in line:
+                      continue
+                  for j in range(i, min(i + 8, len(lines))):
+                      m = re.search(r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b', lines[j])
+                      if m:
+                          targets.append((i, j, m.group(1)))
+                          break
+
+              if not targets:
+                  continue
+
+              # Remove Observation annotations but remember fields explicitly ignored by upstream.
+              ignored_property_lines = set()
+              skip_next_property = False
+              for i, line in enumerate(lines):
+                  if '@ObservationIgnored' in line:
+                      if re.search(r'\bvar\b', line):
+                          ignored_property_lines.add(i)
+                      else:
+                          skip_next_property = True
+                      lines[i] = line.replace('@ObservationIgnored', '')
+                      continue
+                  if skip_next_property and re.search(r'\bvar\b', line):
+                      ignored_property_lines.add(i)
+                      skip_next_property = False
+
+              # Remove @Observable token/line and alter declarations.
+              for ann_i, decl_i, name in targets:
+                  if name not in observable_classes:
+                      raise SystemExit(f'Unexpected @Observable class {name} in {path}; inspect upstream before continuing.')
+                  lines[ann_i] = lines[ann_i].replace('@Observable', '')
+                  lines[decl_i] = add_observableobject_conformance(lines[decl_i], name)
+                  converted.append(name)
+
+                  # Mark stored properties in this class @Published. Track relative brace depth.
+                  depth = 0
+                  entered = False
+                  for k in range(decl_i, len(lines)):
+                      line = lines[k]
+                      if k == decl_i:
+                          depth += brace_delta(line)
+                          entered = depth > 0
+                          continue
+                      if not entered:
+                          depth += brace_delta(line)
+                          entered = depth > 0
+                          continue
+                      # Directly inside the class body => relative depth 1.
+                      if depth == 1 and should_publish(line, k in ignored_property_lines):
+                          indent = line[:len(line) - len(line.lstrip())]
+                          lines[k] = indent + '@Published ' + line.lstrip()
+                          published += 1
+                      depth += brace_delta(line)
+                      if depth <= 0:
+                          break
+
+              text = '\n'.join(lines) + ('\n' if original.endswith('\n') else '')
+              # Combine owns ObservableObject / @Published / @ObservedObject.
+              if 'import Combine' not in text:
+                  imports = list(re.finditer(r'^import\s+[^\n]+$', text, flags=re.M))
+                  if imports:
+                      pos = imports[-1].end()
+                      text = text[:pos] + '\nimport Combine' + text[pos:]
+                  else:
+                      text = 'import Combine\n' + text
+              # Observation is no longer used in converted model files.
+              text = re.sub(r'^import Observation\s*\n', '', text, flags=re.M)
+              path.write_text(text)
+
+          # 2) SwiftUI bindings: @Bindable is iOS 17. @ObservedObject works with converted SettingsStore.
+          bindable_replacements = 0
+          stateobject_replacements = 0
+          for path in root.rglob('*.swift'):
+              text = path.read_text()
+              n = text.count('@Bindable')
+              if n:
+                  text = text.replace('@Bindable', '@ObservedObject')
+                  bindable_replacements += n
+                  if 'import Combine' not in text and 'import SwiftUI' not in text:
+                      text = 'import SwiftUI\n' + text
+
+              # Convert the common directly-created observable model pattern from @State to @StateObject.
+              # Only direct ClassName(...) initializers are changed, avoiding custom init wiring.
+              for cls in observable_classes:
+                  pat = re.compile(r'@State(?P<mods>\s+(?:(?:private|fileprivate|internal|public)\s+)?)var(?P<body>\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*' + re.escape(cls) + r')?\s*=\s*' + re.escape(cls) + r'\s*\()')
+                  text, c = pat.subn(lambda m: '@StateObject' + (m.group('mods') or ' ') + 'var' + m.group('body'), text)
+                  stateobject_replacements += c
+              path.write_text(text)
+
+          print('Converted @Observable classes:', ', '.join(sorted(set(converted))))
+          print('Added @Published to stored properties:', published)
+          print('Replaced @Bindable:', bindable_replacements)
+          print('Converted direct @State model owners to @StateObject:', stateobject_replacements)
+          missing = observable_classes - set(converted)
+          if missing:
+              print('NOTE: expected classes not seen in this checkout:', ', '.join(sorted(missing)))
           PY
-          grep -n 'ARMSX2_IOS_DEPLOYMENT_TARGET' platforms/ios/app/src/main/cpp/CMakeLists.txt
+
+      - name: Add iOS 16 SwiftUI compatibility helpers
+        shell: bash
+        run: |
+          cat > platforms/ios/app/src/main/swift/Views/IOS16Compatibility.swift <<'SWIFT'
+          import SwiftUI
+
+          // Backport of the two-value iOS 17 onChange closure using iOS 16's one-value API.
+          private struct IOS16TwoValueOnChangeModifier<Value: Equatable>: ViewModifier {
+              let value: Value
+              let action: (Value, Value) -> Void
+              @State private var previous: Value?
+
+              func body(content: Content) -> some View {
+                  content
+                      .onAppear { previous = value }
+                      .onChange(of: value) { newValue in
+                          let oldValue = previous ?? newValue
+                          previous = newValue
+                          action(oldValue, newValue)
+                      }
+              }
+          }
+
+          extension View {
+              func ios16OnChange<Value: Equatable>(of value: Value, _ action: @escaping (Value, Value) -> Void) -> some View {
+                  modifier(IOS16TwoValueOnChangeModifier(value: value, action: action))
+              }
+
+              func ios16OnChange<Value: Equatable>(of value: Value, _ action: @escaping (Value) -> Void) -> some View {
+                  onChange(of: value, perform: action)
+              }
+          }
+
+          // iOS 17 ContentUnavailableView replacement used by ARMSX2 on iOS 16.
+          struct IOS16ContentUnavailableView<Description: View>: View {
+              let title: LocalizedStringKey
+              let systemImage: String
+              @ViewBuilder let description: () -> Description
+
+              init(_ title: LocalizedStringKey, systemImage: String, @ViewBuilder description: @escaping () -> Description) {
+                  self.title = title
+                  self.systemImage = systemImage
+                  self.description = description
+              }
+
+              var body: some View {
+                  VStack(spacing: 12) {
+                      Image(systemName: systemImage)
+                          .font(.system(size: 34, weight: .semibold))
+                      Text(title)
+                          .font(.headline)
+                      description()
+                          .font(.subheadline)
+                          .multilineTextAlignment(.center)
+                  }
+                  .padding()
+              }
+          }
+          SWIFT
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('platforms/ios/app/src/main/swift')
+
+          def strip_member_call(text: str, member: str) -> tuple[str, int]:
+              needle = '.' + member + '('
+              out = []
+              i = 0
+              removed = 0
+              while True:
+                  p = text.find(needle, i)
+                  if p < 0:
+                      out.append(text[i:])
+                      break
+                  out.append(text[i:p])
+                  q = p + len(needle)
+                  depth = 1
+                  in_string = False
+                  escaped = False
+                  while q < len(text) and depth:
+                      ch = text[q]
+                      if in_string:
+                          if escaped:
+                              escaped = False
+                          elif ch == '\\':
+                              escaped = True
+                          elif ch == '"':
+                              in_string = False
+                      else:
+                          if ch == '"':
+                              in_string = True
+                          elif ch == '(':
+                              depth += 1
+                          elif ch == ')':
+                              depth -= 1
+                      q += 1
+                  if depth != 0:
+                      # Do not corrupt source on an unmatched call.
+                      out.append(text[p:])
+                      break
+                  i = q
+                  removed += 1
+              return ''.join(out), removed
+
+          counts = {}
+          for path in root.rglob('*.swift'):
+              if path.name == 'IOS16Compatibility.swift':
+                  continue
+              text = path.read_text()
+
+              # iOS 17 two-value onChange -> compatibility modifier. Existing one-value uses also work.
+              c = text.count('.onChange(of:')
+              if c:
+                  text = text.replace('.onChange(of:', '.ios16OnChange(of:')
+                  counts['onChange'] = counts.get('onChange', 0) + c
+
+              # ShapeStyle shorthand resolves to iOS 17 overloads in Xcode 26 when targeting 16.
+              repls = {
+                  '.fill(.black': '.fill(Color.black',
+                  '.fill(.white': '.fill(Color.white',
+                  '.stroke(.black': '.stroke(Color.black',
+                  '.stroke(.white': '.stroke(Color.white',
+              }
+              for a, b in repls.items():
+                  n = text.count(a)
+                  if n:
+                      text = text.replace(a, b)
+                      counts[a] = counts.get(a, 0) + n
+
+              # These modifiers are cosmetic and unavailable on iOS 16.0. Removing them preserves core behavior.
+              for member in ('contentMargins', 'scrollBounceBehavior', 'symbolEffect', 'contentTransition', 'presentationBackground'):
+                  text, n = strip_member_call(text, member)
+                  if n:
+                      counts[member] = counts.get(member, 0) + n
+
+              # Local replacement for the iOS 17 empty-state view.
+              n = text.count('ContentUnavailableView(')
+              if n:
+                  text = text.replace('ContentUnavailableView(', 'IOS16ContentUnavailableView(')
+                  counts['ContentUnavailableView'] = counts.get('ContentUnavailableView', 0) + n
+
+              # MagnifyGesture is iOS 17. MagnificationGesture exists on iOS 16.
+              if 'MagnifyGesture()' in text:
+                  n = text.count('MagnifyGesture()')
+                  text = text.replace('MagnifyGesture()', 'MagnificationGesture()')
+                  # ARMSX2's layout editor reads MagnifyGesture.Value.magnification. The older
+                  # MagnificationGesture value is already the CGFloat scale itself.
+                  text = re.sub(r'\b([A-Za-z_][A-Za-z0-9_]*)\.magnification\b', r'\1', text)
+                  counts['MagnifyGesture'] = counts.get('MagnifyGesture', 0) + n
+
+              path.write_text(text)
+
+          print('SwiftUI compatibility rewrites:')
+          for k, v in sorted(counts.items()):
+              print(f'  {k}: {v}')
+          PY
+
+      - name: Show remaining iOS 17 source markers
+        shell: bash
+        run: |
+          echo 'Remaining explicit Observation / iOS17 markers (diagnostic only):'
+          grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(' platforms/ios/app/src/main/swift || true
 
       - name: Build unsigned iOS 16 IPA
         id: build
@@ -63,7 +400,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned
+          name: ARMSX2-iOS16-unsigned-v2
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -71,12 +408,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log
+          name: ARMSX2-iOS16-build-log-v2
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
-      - name: Fail if the iOS 16 source build failed
+      - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The source does not currently build cleanly for iOS 16. Check the uploaded xcodebuild log for the first availability/linker error.' >&2
+          echo 'The iOS 16 compatibility pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v2 and inspect the first real error.' >&2
           exit 1
