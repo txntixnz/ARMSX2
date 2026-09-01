@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9 GT4 analog trigger pedals)
+name: Build ARMSX2 for iOS 16 (compat v9.1 GT4 direct pad injection)
 
 on:
   workflow_dispatch:
@@ -764,26 +764,96 @@ jobs:
               scene = scene[:pos] + boot_code + scene[pos:]
               scene_path.write_text(scene)
 
-          # 3) Translate physical L2/R2 axes to PS2 RightY.
-          input_tag = '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT'
+          # 3) Translate physical L2/R2 directly into the emulated PS2
+          #    DualShock 2 right-stick half axes.
+          #
+          # V9 attempted to synthesize an SDL RightY host event. Field testing
+          # proved that this did not reach GT4's emulated right stick reliably
+          # on the iOS build. V9.1 bypasses the host binding map and writes the
+          # actual PS2 pad states via Pad::SetControllerState().
+          input_tag = '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_DIRECT_PAD_V91'
           sdl = sdl_path.read_text()
           if input_tag not in sdl:
+              if '#include "SIO/Pad/Pad.h"' not in sdl:
+                  include_anchor = '#include "Input/InputManager.h"'
+                  if include_anchor not in sdl:
+                      raise SystemExit(
+                          'GT4 trigger-pedal V9.1 patch: SDLInputSource input includes changed upstream.'
+                      )
+                  sdl = sdl.replace(
+                      include_anchor,
+                      include_anchor + '\n#include "SIO/Pad/Pad.h"',
+                      1,
+                  )
+
               if '#include <cstdlib>' not in sdl:
                   include_anchor = '#include <cmath>'
                   if include_anchor not in sdl:
-                      raise SystemExit('GT4 trigger-pedal patch: SDLInputSource standard includes changed upstream.')
+                      raise SystemExit(
+                          'GT4 trigger-pedal V9.1 patch: SDLInputSource standard includes changed upstream.'
+                      )
                   sdl = sdl.replace(include_anchor, include_anchor + '\n#include <cstdlib>', 1)
 
               normalize_anchor = 'static float NormalizeS16(s16 value)'
               normalize_pos = sdl.find(normalize_anchor)
               if normalize_pos < 0:
-                  raise SystemExit('GT4 trigger-pedal patch: NormalizeS16 changed upstream.')
+                  raise SystemExit(
+                      'GT4 trigger-pedal V9.1 patch: NormalizeS16 changed upstream.'
+                  )
 
-              helper = '''// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT
+              helper = '''// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_DIRECT_PAD_V91
           static bool ARMSX2GT4TriggerPedalsEnabled()
           {
               const char* value = std::getenv("ARMSX2_GT4_TRIGGER_PEDALS");
               return value && value[0] == '1';
+          }
+
+          static bool ARMSX2GT4SetPS2RightStickY(float right_y)
+          {
+              // Single local controller -> PS2 Pad 1.
+              constexpr u32 pad_index = 0;
+
+              const Pad::ControllerInfo* info =
+                  Pad::GetControllerInfo(EmuConfig.Pad.Ports[pad_index].Type);
+              if (!info)
+                  return false;
+
+              bool found_up = false;
+              bool found_down = false;
+              u32 up_bind = 0;
+              u32 down_bind = 0;
+
+              for (const InputBindingInfo& bi : info->bindings)
+              {
+                  if (bi.generic_mapping == GenericInputBinding::RightStickUp)
+                  {
+                      up_bind = bi.bind_index;
+                      found_up = true;
+                  }
+                  else if (bi.generic_mapping == GenericInputBinding::RightStickDown)
+                  {
+                      down_bind = bi.bind_index;
+                      found_down = true;
+                  }
+              }
+
+              if (!found_up || !found_down)
+                  return false;
+
+              if (right_y < -1.0f)
+                  right_y = -1.0f;
+              else if (right_y > 1.0f)
+                  right_y = 1.0f;
+
+              // PCSX2 exposes stick directions as separate HalfAxis inputs.
+              // Collapse simultaneous pedal pressure first, then drive only
+              // one half-axis so opposing values never fight each other.
+              const float up_value = (right_y < 0.0f) ? -right_y : 0.0f;
+              const float down_value = (right_y > 0.0f) ? right_y : 0.0f;
+
+              Pad::SetControllerState(pad_index, up_bind, up_value);
+              Pad::SetControllerState(pad_index, down_bind, down_value);
+              return true;
           }
 
           '''
@@ -792,63 +862,81 @@ jobs:
               function_anchor = 'bool SDLInputSource::HandleGamepadAxisEvent(const SDL_GamepadAxisEvent* ev)'
               function_pos = sdl.find(function_anchor)
               if function_pos < 0:
-                  raise SystemExit('GT4 trigger-pedal patch: HandleGamepadAxisEvent changed upstream.')
+                  raise SystemExit(
+                      'GT4 trigger-pedal V9.1 patch: HandleGamepadAxisEvent changed upstream.'
+                  )
 
               key_match = re.search(r'\n[ \t]*const InputBindingKey key\(', sdl[function_pos:])
               if not key_match:
-                  raise SystemExit('GT4 trigger-pedal patch: normal gamepad-axis dispatch point changed upstream.')
+                  raise SystemExit(
+                      'GT4 trigger-pedal V9.1 patch: normal gamepad-axis dispatch point changed upstream.'
+                  )
               key_pos = function_pos + key_match.start() + 1
 
-              pedal_block = '''\t// GT4 analog trigger-pedal mode. Trigger events are consumed here so
-          \t// they do not simultaneously reach the PS2 L2/R2 bindings.
+              pedal_block = '''\t// GT4 V9.1: direct PS2 pad injection.
+          \t//
+          \t// R2 -> Right Stick Up   -> GT4 throttle
+          \t// L2 -> Right Stick Down -> GT4 brake
+          \t//
+          \t// Trigger events are consumed while this mode is enabled so they
+          \t// do not also reach the normal PS2 L2/R2 bindings.
           \tif (ARMSX2GT4TriggerPedalsEnabled() && it->gamepad)
           \t{
           \t\tconst bool is_left_trigger = (ev->axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
           \t\tconst bool is_right_trigger = (ev->axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
           \t\tconst bool is_trigger = is_left_trigger || is_right_trigger;
+          \t\tconst bool is_right_y = (ev->axis == SDL_GAMEPAD_AXIS_RIGHTY);
 
-          \t\tif (is_trigger || ev->axis == SDL_GAMEPAD_AXIS_RIGHTY)
+          \t\tif (is_trigger || is_right_y)
           \t\t{
-          \t\t\ts16 left_trigger = SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-          \t\t\ts16 right_trigger = SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+          \t\t\ts16 left_trigger =
+          \t\t\t\tSDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+          \t\t\ts16 right_trigger =
+          \t\t\t\tSDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
 
+          \t\t\t// Use the event value for whichever trigger is changing so the
+          \t\t\t// output does not depend on SDL's internal snapshot timing.
           \t\t\tif (is_left_trigger)
-          \t\t\t\tleft_trigger = (ev->value > 0) ? ev->value : 0;
+          \t\t\t\tleft_trigger = ev->value;
           \t\t\telse if (is_right_trigger)
-          \t\t\t\tright_trigger = (ev->value > 0) ? ev->value : 0;
+          \t\t\t\tright_trigger = ev->value;
 
-          \t\t\tleft_trigger = (left_trigger > 0) ? left_trigger : 0;
-          \t\t\tright_trigger = (right_trigger > 0) ? right_trigger : 0;
+          \t\t\tif (left_trigger < 0)
+          \t\t\t\tleft_trigger = 0;
+          \t\t\tif (right_trigger < 0)
+          \t\t\t\tright_trigger = 0;
 
-          \t\t\tconst bool pedals_active = (left_trigger > 0 || right_trigger > 0);
-          \t\t\tif (is_trigger || pedals_active)
+          \t\t\tconst bool pedals_active =
+          \t\t\t\t(left_trigger > 0 || right_trigger > 0);
+
+          \t\t\tif (pedals_active)
           \t\t\t{
-          \t\t\t\tfloat synthetic_right_y;
-          \t\t\t\tif (pedals_active)
-          \t\t\t\t{
-          \t\t\t\t\t// R2 -> negative/right-stick UP (throttle)
-          \t\t\t\t\t// L2 -> positive/right-stick DOWN (brake)
-          \t\t\t\t\tsynthetic_right_y =
-          \t\t\t\t\t\tstatic_cast<float>(static_cast<int>(left_trigger) -
-          \t\t\t\t\t\t                   static_cast<int>(right_trigger)) /
-          \t\t\t\t\t\t32767.0f;
-          \t\t\t\t}
-          \t\t\t\telse
-          \t\t\t\t{
-          \t\t\t\t\t// Both pedals were just released. Restore physical RightY.
-          \t\t\t\t\tsynthetic_right_y =
-          \t\t\t\t\t\tNormalizeS16(SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHTY));
-          \t\t\t\t}
+          \t\t\t\t// Signed PS2 RightY:
+          \t\t\t\t//   R2 gives negative Y -> RightStickUp
+          \t\t\t\t//   L2 gives positive Y -> RightStickDown
+          \t\t\t\tconst float pedal_right_y =
+          \t\t\t\t\tstatic_cast<float>(
+          \t\t\t\t\t\tstatic_cast<int>(left_trigger) -
+          \t\t\t\t\t\tstatic_cast<int>(right_trigger)) /
+          \t\t\t\t\t32767.0f;
 
-          \t\t\t\tconst InputBindingKey right_y_key(
-          \t\t\t\t\tMakeGenericControllerAxisKey(
-          \t\t\t\t\t\tInputSourceType::SDL, it->player_id, SDL_GAMEPAD_AXIS_RIGHTY));
-          \t\t\t\tInputManager::InvokeEvents(
-          \t\t\t\t\tright_y_key, synthetic_right_y, GenericInputBinding::Unknown,
-          \t\t\t\t\ts_sdl_generic_binding_axis_mapping[SDL_GAMEPAD_AXIS_RIGHTY][0],
-          \t\t\t\t\ts_sdl_generic_binding_axis_mapping[SDL_GAMEPAD_AXIS_RIGHTY][1]);
+          \t\t\t\tARMSX2GT4SetPS2RightStickY(pedal_right_y);
           \t\t\t\treturn true;
           \t\t\t}
+
+          \t\t\tif (is_trigger)
+          \t\t\t{
+          \t\t\t\t// Final trigger release: immediately hand Y back to the
+          \t\t\t\t// physical right stick, even if it has not moved this frame.
+          \t\t\t\tconst float physical_right_y =
+          \t\t\t\t\tNormalizeS16(
+          \t\t\t\t\t\tSDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHTY));
+          \t\t\t\tARMSX2GT4SetPS2RightStickY(physical_right_y);
+          \t\t\t\treturn true;
+          \t\t\t}
+
+          \t\t\t// No pedal is active and this is a real RightY event. Fall
+          \t\t\t// through to PCSX2's stock binding path.
           \t\t}
           \t}
 
@@ -859,10 +947,10 @@ jobs:
           print('GT4 analog trigger-pedal feature patched successfully.')
           print(f'  Swift UI: {swift_path}')
           print(f'  Cold-launch persistence: {scene_path}')
-          print(f'  SDL analog translation: {sdl_path}')
+          print(f'  SDL direct PS2 pad injection: {sdl_path}')
           PY
 
-      - name: Verify GT4 analog trigger pedals
+      - name: Verify GT4 analog trigger pedals V9.1
         shell: bash
         run: |
           set -euo pipefail
@@ -877,34 +965,62 @@ jobs:
             platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
           echo
 
-          echo 'SDL analog translation wiring:'
-          grep -n -A95 -B5 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT' \
+          echo 'Direct PS2 pad injection wiring:'
+          grep -n -A125 -B8 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_DIRECT_PAD_V91' \
             pcsx2/Input/SDLInputSource.cpp
           echo
 
+          grep -q '#include "SIO/Pad/Pad.h"' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'Pad::SetControllerState(pad_index, up_bind, up_value);' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'Pad::SetControllerState(pad_index, down_bind, down_value);' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::RightStickUp' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::RightStickDown' pcsx2/Input/SDLInputSource.cpp
+
           python3 - <<'PY'
-          def right_y(l2: int, r2: int) -> float:
+          def direct_half_axes(l2: int, r2: int):
               l2 = max(0, min(32767, l2))
               r2 = max(0, min(32767, r2))
-              return (l2 - r2) / 32767.0
+              signed_y = (l2 - r2) / 32767.0
+              up = -signed_y if signed_y < 0.0 else 0.0
+              down = signed_y if signed_y > 0.0 else 0.0
+              return signed_y, up, down
 
           tests = [
-              ('released',     0,     0,      0.0),
-              ('R2 full',      0, 32767,     -1.0),
-              ('L2 full',  32767,     0,      1.0),
-              ('R2 half',      0, 16384, -16384 / 32767.0),
-              ('L2 half',  16384,     0,  16384 / 32767.0),
-              ('both equal', 12000, 12000,     0.0),
+              ('released',     0,     0,      0.0, 0.0, 0.0),
+              ('R2 full',      0, 32767,     -1.0, 1.0, 0.0),
+              ('L2 full',  32767,     0,      1.0, 0.0, 1.0),
+              ('R2 half',      0, 16384, -16384 / 32767.0, 16384 / 32767.0, 0.0),
+              ('L2 half',  16384,     0,  16384 / 32767.0, 0.0, 16384 / 32767.0),
+              ('both equal', 12000, 12000,     0.0, 0.0, 0.0),
+              ('R2 wins',   8000, 20000, -12000 / 32767.0, 12000 / 32767.0, 0.0),
+              ('L2 wins',  20000,  8000,  12000 / 32767.0, 0.0, 12000 / 32767.0),
           ]
 
-          for name, l2, r2, expected in tests:
-              actual = right_y(l2, r2)
-              if abs(actual - expected) > 1e-6:
-                  raise SystemExit(f'GT4 pedal math failed: {name}: expected {expected}, got {actual}')
-              print(f'  {name:10s} L2={l2:5d} R2={r2:5d} -> RightY={actual:+.4f}')
+          for name, l2, r2, ey, eup, edown in tests:
+              y, up, down = direct_half_axes(l2, r2)
+              for label, actual, expected in (
+                  ('Y', y, ey),
+                  ('Up', up, eup),
+                  ('Down', down, edown),
+              ):
+                  if abs(actual - expected) > 1e-6:
+                      raise SystemExit(
+                          f'GT4 V9.1 math failed: {name} {label}: '
+                          f'expected {expected}, got {actual}'
+                      )
+              if up > 0.0 and down > 0.0:
+                  raise SystemExit(f'GT4 V9.1 invalid dual-half-axis state: {name}')
+              print(
+                  f'  {name:10s} L2={l2:5d} R2={r2:5d} '
+                  f'-> Y={y:+.4f} RUp={up:.4f} RDown={down:.4f}'
+              )
 
-          print('Direction contract: R2 -> RightStickUp/throttle; L2 -> RightStickDown/brake')
-          print('GT4 analog trigger-pedal verification passed.')
+          print()
+          print('V9.1 direction contract:')
+          print('  R2 -> PS2 RUp   -> GT4 throttle')
+          print('  L2 -> PS2 RDown -> GT4 brake')
+          print('  equal pressure -> centered Y')
+          print('Direct PS2 pad-injection verification passed.')
           PY
 
       - name: Show remaining iOS 17 source markers
@@ -942,7 +1058,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9-gt4
+          name: ARMSX2-iOS16-unsigned-v9.1-gt4
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -950,12 +1066,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9-gt4
+          name: ARMSX2-iOS16-build-log-v9.1-gt4
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9 GT4 trigger-pedal build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9-gt4 and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.1 GT4 direct-pad build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.1-gt4 and inspect the first real error.' >&2
           exit 1
