@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.3 analog tuning)
+name: Build ARMSX2 for iOS 16 (compat v9.3.1 analog tuning UI hotfix)
 
 on:
   workflow_dispatch:
@@ -1031,7 +1031,7 @@ jobs:
           print(f'  SDL held-trigger polling + direct PS2 injection: {sdl_path}')
           PY
 
-      - name: Add analog tuning V9.3
+      - name: Add analog tuning V9.3.1 UI hotfix
         shell: bash
         run: |
           set -euo pipefail
@@ -1045,22 +1045,25 @@ jobs:
 
           for path in (swift_path, scene_path, sdl_path):
               if not path.is_file():
-                  raise SystemExit(f'Analog tuning V9.3: expected source file missing: {path}')
+                  raise SystemExit(
+                      f'Analog tuning V9.3.1: expected source file missing: {path}'
+                  )
 
           # ==============================================================
-          # SwiftUI: two nested Game Controller tuning menus.
+          # SwiftUI: iOS-16-safe INLINE expandable tuning groups.
+          # No NavigationLink / nested Form / destination view is used.
           # ==============================================================
-          swift_tag = '// ARMSX2_IOS16_ANALOG_TUNING_V93'
+          swift_tag = '// ARMSX2_IOS16_ANALOG_TUNING_INLINE_V931'
           swift = swift_path.read_text()
 
           if swift_tag not in swift:
               struct_anchor = 'struct GamepadSettingsView: View {'
               if struct_anchor not in swift:
                   raise SystemExit(
-                      'Analog tuning V9.3: GamepadSettingsView declaration changed upstream.'
+                      'Analog tuning V9.3.1: GamepadSettingsView declaration changed upstream.'
                   )
 
-              tuning_views = '''// ARMSX2_IOS16_ANALOG_TUNING_V93
+              helper = '''// ARMSX2_IOS16_ANALOG_TUNING_INLINE_V931
           private func armsx2SetAnalogFloatEnvironment(_ key: String, _ value: Double) {
               key.withCString { rawKey in
                   String(value).withCString { rawValue in
@@ -1069,207 +1072,23 @@ jobs:
               }
           }
 
-          private struct ARMSX2LeftSteeringTuningView: View {
-              @Binding var deadzone: Double
-              @Binding var fullThreshold: Double
-
-              var body: some View {
-                  Form {
-                      Section {
-                          VStack(alignment: .leading, spacing: 8) {
-                              HStack {
-                                  Text("Inner Deadzone")
-                                  Spacer()
-                                  Text("\\(Int((deadzone * 100.0).rounded()))%")
-                                      .foregroundColor(.secondary)
-                              }
-
-                              Slider(
-                                  value: Binding(
-                                      get: { deadzone },
-                                      set: { value in
-                                          deadzone = value
-                                          armsx2SetAnalogFloatEnvironment(
-                                              "ARMSX2_LEFT_STEERING_DEADZONE", value
-                                          )
-                                      }
-                                  ),
-                                  in: 0.0...0.30,
-                                  step: 0.01
-                              )
-                          }
-
-                          VStack(alignment: .leading, spacing: 8) {
-                              HStack {
-                                  Text("Full Steering Threshold")
-                                  Spacer()
-                                  Text("\\(Int((fullThreshold * 100.0).rounded()))%")
-                                      .foregroundColor(.secondary)
-                              }
-
-                              Slider(
-                                  value: Binding(
-                                      get: { fullThreshold },
-                                      set: { value in
-                                          fullThreshold = value
-                                          armsx2SetAnalogFloatEnvironment(
-                                              "ARMSX2_LEFT_STEERING_FULL_THRESHOLD", value
-                                          )
-                                      }
-                                  ),
-                                  in: 0.50...1.00,
-                                  step: 0.01
-                              )
-                          }
-                      } header: {
-                          Text("Left Stick Steering")
-                      } footer: {
-                          Text("Inner Deadzone ignores small left-stick X movement around center. Full Steering Threshold sets how far the physical stick must move to reach 100% steering. Only steering (left-stick X) is changed.")
-                      }
-
-                      Section {
-                          Button("Reset Steering Tuning") {
-                              deadzone = 0.0
-                              fullThreshold = 1.0
-                              armsx2SetAnalogFloatEnvironment(
-                                  "ARMSX2_LEFT_STEERING_DEADZONE", 0.0
-                              )
-                              armsx2SetAnalogFloatEnvironment(
-                                  "ARMSX2_LEFT_STEERING_FULL_THRESHOLD", 1.0
-                              )
-                          }
-                      }
-                  }
-                  .navigationTitle("Left Stick Steering")
-                  .onAppear {
-                      armsx2SetAnalogFloatEnvironment(
-                          "ARMSX2_LEFT_STEERING_DEADZONE", deadzone
-                      )
-                      armsx2SetAnalogFloatEnvironment(
-                          "ARMSX2_LEFT_STEERING_FULL_THRESHOLD", fullThreshold
-                      )
-                  }
-              }
-          }
-
-          private struct ARMSX2GT4PedalTuningView: View {
-              @Binding var enabled: Bool
-              @Binding var deadzone: Double
-              @Binding var fullThreshold: Double
-
-              var body: some View {
-                  Form {
-                      Section {
-                          Toggle(isOn: Binding(
-                              get: { enabled },
-                              set: { value in
-                                  enabled = value
-                                  armsx2SetGT4TriggerPedalsEnvironment(value)
-                              }
-                          )) {
-                              VStack(alignment: .leading, spacing: 3) {
-                                  Text("Analog Trigger Pedals")
-                                  Text("R2 = Throttle · L2 = Brake")
-                                      .font(.caption)
-                                      .foregroundColor(.secondary)
-                              }
-                          }
-                      } header: {
-                          Text("Gran Turismo 4")
-                      }
-
-                      Section {
-                          VStack(alignment: .leading, spacing: 8) {
-                              HStack {
-                                  Text("Trigger Deadzone")
-                                  Spacer()
-                                  Text("\\(Int((deadzone * 100.0).rounded()))%")
-                                      .foregroundColor(.secondary)
-                              }
-
-                              Slider(
-                                  value: Binding(
-                                      get: { deadzone },
-                                      set: { value in
-                                          deadzone = value
-                                          armsx2SetAnalogFloatEnvironment(
-                                              "ARMSX2_GT4_TRIGGER_DEADZONE", value
-                                          )
-                                      }
-                                  ),
-                                  in: 0.0...0.30,
-                                  step: 0.01
-                              )
-                          }
-
-                          VStack(alignment: .leading, spacing: 8) {
-                              HStack {
-                                  Text("Full Trigger Threshold")
-                                  Spacer()
-                                  Text("\\(Int((fullThreshold * 100.0).rounded()))%")
-                                      .foregroundColor(.secondary)
-                              }
-
-                              Slider(
-                                  value: Binding(
-                                      get: { fullThreshold },
-                                      set: { value in
-                                          fullThreshold = value
-                                          armsx2SetAnalogFloatEnvironment(
-                                              "ARMSX2_GT4_TRIGGER_FULL_THRESHOLD", value
-                                          )
-                                      }
-                                  ),
-                                  in: 0.50...1.00,
-                                  step: 0.01
-                              )
-                          }
-                      } header: {
-                          Text("Pedal Response")
-                      } footer: {
-                          Text("Trigger Deadzone controls how far R2/L2 must move before throttle or brake begins. Full Trigger Threshold controls how far the trigger must travel to reach 100% pedal input.")
-                      }
-
-                      Section {
-                          Button("Reset Pedal Tuning") {
-                              deadzone = 0.0
-                              fullThreshold = 1.0
-                              armsx2SetAnalogFloatEnvironment(
-                                  "ARMSX2_GT4_TRIGGER_DEADZONE", 0.0
-                              )
-                              armsx2SetAnalogFloatEnvironment(
-                                  "ARMSX2_GT4_TRIGGER_FULL_THRESHOLD", 1.0
-                              )
-                          }
-                      }
-                  }
-                  .navigationTitle("GT4 Trigger Pedals")
-                  .onAppear {
-                      armsx2SetGT4TriggerPedalsEnvironment(enabled)
-                      armsx2SetAnalogFloatEnvironment(
-                          "ARMSX2_GT4_TRIGGER_DEADZONE", deadzone
-                      )
-                      armsx2SetAnalogFloatEnvironment(
-                          "ARMSX2_GT4_TRIGGER_FULL_THRESHOLD", fullThreshold
-                      )
-                  }
-              }
-          }
-
           '''
-              swift = swift.replace(struct_anchor, tuning_views + struct_anchor, 1)
+              swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
 
-              storage_anchor = (
-                  '    @AppStorage("ARMSX2_GT4TriggerPedals") '
-                  'private var gt4TriggerPedals = false\n'
+              # Find the existing V9.2 GT4 AppStorage property robustly.
+              storage_re = re.compile(
+                  r'([ \t]*@AppStorage\("ARMSX2_GT4TriggerPedals"\)'
+                  r'[ \t]+private[ \t]+var[ \t]+gt4TriggerPedals'
+                  r'[ \t]*=[ \t]*false[ \t]*\n)'
               )
-              if storage_anchor not in swift:
+              storage_match = storage_re.search(swift)
+              if not storage_match:
                   raise SystemExit(
-                      'Analog tuning V9.3: V9.2 GT4 AppStorage property not found.'
+                      'Analog tuning V9.3.1: V9.2 GT4 AppStorage property not found.'
                   )
 
               extra_storage = (
-                  storage_anchor +
+                  storage_match.group(1) +
                   '    @AppStorage("ARMSX2_LeftSteeringDeadzone") '
                   'private var leftSteeringDeadzone = 0.0\n'
                   '    @AppStorage("ARMSX2_LeftSteeringFullThreshold") '
@@ -1279,27 +1098,86 @@ jobs:
                   '    @AppStorage("ARMSX2_GT4TriggerFullThreshold") '
                   'private var gt4TriggerFullThreshold = 1.0\n'
               )
-              swift = swift.replace(storage_anchor, extra_storage, 1)
+              swift = (
+                  swift[:storage_match.start()] +
+                  extra_storage +
+                  swift[storage_match.end():]
+              )
 
               rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
               if rumble_pos < 0:
                   raise SystemExit(
-                      'Analog tuning V9.3: Game Controller Tools section changed upstream.'
+                      'Analog tuning V9.3.1: Game Controller Tools section changed upstream.'
                   )
 
               tools_section_pos = swift.rfind('Section {', 0, rumble_pos)
               if tools_section_pos < 0:
                   raise SystemExit(
-                      'Analog tuning V9.3: could not locate Game Controller Tools section.'
+                      'Analog tuning V9.3.1: could not locate Game Controller Tools section.'
                   )
 
               tuning_section = '''Section {
-                      NavigationLink(
-                          destination: ARMSX2LeftSteeringTuningView(
-                              deadzone: $leftSteeringDeadzone,
-                              fullThreshold: $leftSteeringFullThreshold
-                          )
-                      ) {
+                      DisclosureGroup {
+                          VStack(alignment: .leading, spacing: 10) {
+                              HStack {
+                                  Text("Inner Deadzone")
+                                  Spacer()
+                                  Text("\\(Int((leftSteeringDeadzone * 100.0).rounded()))%")
+                                      .foregroundColor(.secondary)
+                              }
+
+                              Slider(
+                                  value: Binding(
+                                      get: { leftSteeringDeadzone },
+                                      set: { value in
+                                          leftSteeringDeadzone = value
+                                          armsx2SetAnalogFloatEnvironment(
+                                              "ARMSX2_LEFT_STEERING_DEADZONE", value
+                                          )
+                                      }
+                                  ),
+                                  in: 0.0...0.30,
+                                  step: 0.01
+                              )
+
+                              HStack {
+                                  Text("Full Steering Threshold")
+                                  Spacer()
+                                  Text("\\(Int((leftSteeringFullThreshold * 100.0).rounded()))%")
+                                      .foregroundColor(.secondary)
+                              }
+
+                              Slider(
+                                  value: Binding(
+                                      get: { leftSteeringFullThreshold },
+                                      set: { value in
+                                          leftSteeringFullThreshold = value
+                                          armsx2SetAnalogFloatEnvironment(
+                                              "ARMSX2_LEFT_STEERING_FULL_THRESHOLD", value
+                                          )
+                                      }
+                                  ),
+                                  in: 0.50...1.00,
+                                  step: 0.01
+                              )
+
+                              Text("Deadzone ignores small steering movement around center. Full Steering Threshold sets how far the left stick must move before the emulator receives 100% steering.")
+                                  .font(.caption)
+                                  .foregroundColor(.secondary)
+
+                              Button("Reset Steering Tuning") {
+                                  leftSteeringDeadzone = 0.0
+                                  leftSteeringFullThreshold = 1.0
+                                  armsx2SetAnalogFloatEnvironment(
+                                      "ARMSX2_LEFT_STEERING_DEADZONE", 0.0
+                                  )
+                                  armsx2SetAnalogFloatEnvironment(
+                                      "ARMSX2_LEFT_STEERING_FULL_THRESHOLD", 1.0
+                                  )
+                              }
+                          }
+                          .padding(.vertical, 6)
+                      } label: {
                           Label {
                               VStack(alignment: .leading, spacing: 3) {
                                   Text("Left Stick Steering")
@@ -1312,17 +1190,71 @@ jobs:
                           }
                       }
 
-                      NavigationLink(
-                          destination: ARMSX2GT4PedalTuningView(
-                              enabled: $gt4TriggerPedals,
-                              deadzone: $gt4TriggerDeadzone,
-                              fullThreshold: $gt4TriggerFullThreshold
-                          )
-                      ) {
+                      DisclosureGroup {
+                          VStack(alignment: .leading, spacing: 10) {
+                              HStack {
+                                  Text("Trigger Deadzone")
+                                  Spacer()
+                                  Text("\\(Int((gt4TriggerDeadzone * 100.0).rounded()))%")
+                                      .foregroundColor(.secondary)
+                              }
+
+                              Slider(
+                                  value: Binding(
+                                      get: { gt4TriggerDeadzone },
+                                      set: { value in
+                                          gt4TriggerDeadzone = value
+                                          armsx2SetAnalogFloatEnvironment(
+                                              "ARMSX2_GT4_TRIGGER_DEADZONE", value
+                                          )
+                                      }
+                                  ),
+                                  in: 0.0...0.30,
+                                  step: 0.01
+                              )
+
+                              HStack {
+                                  Text("Full Trigger Threshold")
+                                  Spacer()
+                                  Text("\\(Int((gt4TriggerFullThreshold * 100.0).rounded()))%")
+                                      .foregroundColor(.secondary)
+                              }
+
+                              Slider(
+                                  value: Binding(
+                                      get: { gt4TriggerFullThreshold },
+                                      set: { value in
+                                          gt4TriggerFullThreshold = value
+                                          armsx2SetAnalogFloatEnvironment(
+                                              "ARMSX2_GT4_TRIGGER_FULL_THRESHOLD", value
+                                          )
+                                      }
+                                  ),
+                                  in: 0.50...1.00,
+                                  step: 0.01
+                              )
+
+                              Text("Trigger Deadzone controls how far R2/L2 move before throttle or brake begins. Full Trigger Threshold controls how far the trigger must travel before the emulator receives 100%.")
+                                  .font(.caption)
+                                  .foregroundColor(.secondary)
+
+                              Button("Reset Pedal Tuning") {
+                                  gt4TriggerDeadzone = 0.0
+                                  gt4TriggerFullThreshold = 1.0
+                                  armsx2SetAnalogFloatEnvironment(
+                                      "ARMSX2_GT4_TRIGGER_DEADZONE", 0.0
+                                  )
+                                  armsx2SetAnalogFloatEnvironment(
+                                      "ARMSX2_GT4_TRIGGER_FULL_THRESHOLD", 1.0
+                                  )
+                              }
+                          }
+                          .padding(.vertical, 6)
+                      } label: {
                           Label {
                               VStack(alignment: .leading, spacing: 3) {
-                                  Text("GT4 Trigger Pedals")
-                                  Text("R2 throttle · L2 brake · analog tuning")
+                                  Text("GT4 Trigger Response")
+                                  Text("R2 throttle · L2 brake tuning")
                                       .font(.caption)
                                       .foregroundColor(.secondary)
                               }
@@ -1333,17 +1265,21 @@ jobs:
                   } header: {
                       Text("Analog Tuning")
                   } footer: {
-                      Text("Defaults are 0% deadzone and 100% full threshold, which preserves stock steering and the field-proven V9.2 trigger response.")
+                      Text("Defaults are 0% deadzone and 100% full threshold. Those defaults preserve stock left-stick steering and the field-proven V9.2 GT4 trigger response.")
                   }
 
                   '''
-              swift = swift[:tools_section_pos] + tuning_section + swift[tools_section_pos:]
+              swift = (
+                  swift[:tools_section_pos] +
+                  tuning_section +
+                  swift[tools_section_pos:]
+              )
               swift_path.write_text(swift)
 
           # ==============================================================
           # SceneDelegate: restore tuning values on cold launch.
           # ==============================================================
-          scene_tag = '// ARMSX2_IOS16_ANALOG_TUNING_BOOT_V93'
+          scene_tag = '// ARMSX2_IOS16_ANALOG_TUNING_BOOT_V931'
           scene = scene_path.read_text()
 
           if scene_tag not in scene:
@@ -1351,22 +1287,22 @@ jobs:
                   if '#include <stdlib.h>' in scene:
                       scene = scene.replace(
                           '#include <stdlib.h>',
-                          '#include <stdlib.h>\n#include <stdio.h>',
+                          '#include <stdlib.h>\\n#include <stdio.h>',
                           1
                       )
                   else:
                       raise SystemExit(
-                          'Analog tuning V9.3: expected V9.2 stdlib include is missing.'
+                          'Analog tuning V9.3.1: expected V9.2 stdlib include is missing.'
                       )
 
               init_anchor = '// --- SDL Initialization ---'
               init_pos = scene.find(init_anchor)
               if init_pos < 0:
                   raise SystemExit(
-                      'Analog tuning V9.3: SceneDelegate SDL initialization marker changed upstream.'
+                      'Analog tuning V9.3.1: SceneDelegate SDL initialization marker changed upstream.'
                   )
 
-              tuning_boot = '''// ARMSX2_IOS16_ANALOG_TUNING_BOOT_V93
+              tuning_boot = '''// ARMSX2_IOS16_ANALOG_TUNING_BOOT_V931
           NSUserDefaults *armsx2TuningDefaults = [NSUserDefaults standardUserDefaults];
 
           const double armsx2LeftSteeringDeadzone =
@@ -1409,10 +1345,10 @@ jobs:
               scene_path.write_text(scene)
 
           # ==============================================================
-          # Native input: steering X + GT4 pedal tuning.
-          # Keep the V9.2 held-poll/direct-pad architecture untouched.
+          # Native input tuning.
+          # IMPORTANT: V9.2 held-trigger / direct-pad code remains intact.
           # ==============================================================
-          cpp_tag = '// ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V93'
+          cpp_tag = '// ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931'
           sdl = sdl_path.read_text()
 
           if cpp_tag not in sdl:
@@ -1420,10 +1356,10 @@ jobs:
               v92_pos = sdl.find(v92_tag)
               if v92_pos < 0:
                   raise SystemExit(
-                      'Analog tuning V9.3: golden V9.2 held-poll marker is missing.'
+                      'Analog tuning V9.3.1: golden V9.2 held-poll marker is missing.'
                   )
 
-              helpers = '''// ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V93
+              helpers = '''// ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931
           static float ARMSX2AnalogTuningEnv(const char* key, float fallback)
           {
               const char* value = std::getenv(key);
@@ -1484,6 +1420,8 @@ jobs:
           '''
               sdl = sdl[:v92_pos] + helpers + sdl[v92_pos:]
 
+              # V9.2 has exactly two signed pedal math sites:
+              # held polling + immediate trigger-edge handling.
               pedal_math = re.compile(
                   r'const float pedal_right_y\s*=\s*'
                   r'static_cast<float>\(\s*'
@@ -1495,8 +1433,8 @@ jobs:
               matches = list(pedal_math.finditer(sdl))
               if len(matches) != 2:
                   raise SystemExit(
-                      'Analog tuning V9.3: expected exactly two V9.2 pedal math sites '
-                      f'(held poll + edge handler), found {len(matches)}.'
+                      'Analog tuning V9.3.1: expected exactly two V9.2 pedal math '
+                      f'sites, found {len(matches)}.'
                   )
 
               tuned_pedal_math = '''const float left_pedal =
@@ -1507,6 +1445,8 @@ jobs:
 
               sdl = pedal_math.sub(tuned_pedal_math, sdl)
 
+              # Apply steering tuning only to LEFT STICK X, before stock
+              # PCSX2 generic binding dispatch.
               function_anchor = (
                   'bool SDLInputSource::HandleGamepadAxisEvent('
                   'const SDL_GamepadAxisEvent* ev)'
@@ -1514,7 +1454,7 @@ jobs:
               function_pos = sdl.find(function_anchor)
               if function_pos < 0:
                   raise SystemExit(
-                      'Analog tuning V9.3: HandleGamepadAxisEvent changed upstream.'
+                      'Analog tuning V9.3.1: HandleGamepadAxisEvent changed upstream.'
                   )
 
               value_re = re.compile(
@@ -1523,8 +1463,8 @@ jobs:
               value_match = value_re.search(sdl, function_pos)
               if not value_match:
                   raise SystemExit(
-                      'Analog tuning V9.3: stock normalized SDL axis value declaration '
-                      'changed upstream.'
+                      'Analog tuning V9.3.1: stock normalized SDL axis value '
+                      'declaration changed upstream.'
                   )
 
               steering_value = '''float value = NormalizeS16(ev->value);
@@ -1547,8 +1487,8 @@ jobs:
 
               sdl_path.write_text(sdl)
 
-          print('Analog tuning V9.3 patched successfully.')
-          print(f'  Swift menus: {swift_path}')
+          print('Analog tuning V9.3.1 UI hotfix patched successfully.')
+          print(f'  Inline expandable controls: {swift_path}')
           print(f'  Cold-launch tuning persistence: {scene_path}')
           print(f'  Native steering/pedal tuning: {sdl_path}')
           PY
@@ -1615,28 +1555,33 @@ jobs:
           print('V9.2 direct held-trigger polling verification passed.')
           PY
 
-      - name: Verify analog tuning V9.3
+      - name: Verify analog tuning V9.3.1
         shell: bash
         run: |
           set -euo pipefail
 
-          echo 'Analog Tuning UI:'
-          grep -n -A220 -B10 'ARMSX2_IOS16_ANALOG_TUNING_V93' \
+          echo 'Inline iOS 16 tuning UI:'
+          grep -n -A190 -B10 'ARMSX2_IOS16_ANALOG_TUNING_INLINE_V931' \
             platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
           echo
 
-          echo 'Analog Tuning native path:'
-          grep -n -A130 -B8 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V93' \
+          echo 'Native tuning path:'
+          grep -n -A130 -B8 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' \
             pcsx2/Input/SDLInputSource.cpp
           echo
 
-          grep -q 'ARMSX2LeftSteeringTuningView' \
+          # Freeze regression guard: V9.3.1 must not add tuning NavigationLinks.
+          if grep -n 'ARMSX2LeftSteeringTuningView\|ARMSX2GT4PedalTuningView' \
+              platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift; then
+            echo 'ERROR: old V9.3 nested tuning destination views are present.' >&2
+            exit 1
+          fi
+
+          grep -q 'DisclosureGroup' \
             platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
-          grep -q 'ARMSX2GT4PedalTuningView' \
+          grep -q 'Left Stick Steering' \
             platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
-          grep -q 'Full Steering Threshold' \
-            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
-          grep -q 'Full Trigger Threshold' \
+          grep -q 'GT4 Trigger Response' \
             platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
 
           grep -q 'ARMSX2ApplyDeadzoneThreshold' pcsx2/Input/SDLInputSource.cpp
@@ -1667,36 +1612,35 @@ jobs:
                   (full_threshold - deadzone)
               )
 
-          # Critical invariant: V9.3 defaults must be exactly transparent.
+          # Golden behavior invariant.
           for sample in [-1.0, -0.75, -0.5, -0.1, 0.0, 0.1, 0.5, 0.75, 1.0]:
               actual = tune(sample, 0.0, 1.0)
               if abs(actual - sample) > 1e-7:
                   raise SystemExit(
-                      f'Golden V9.2 transparency failed: {sample} -> {actual}'
+                      f'V9.2 default transparency failed: {sample} -> {actual}'
                   )
 
-          # 10% deadzone / 80% full threshold:
-          # 10% input => 0; 45% => 50%; 80% => 100%.
-          cases = [
-              (0.05, 0.0),
-              (0.10, 0.0),
-              (0.45, 0.5),
-              (0.80, 1.0),
-              (-0.45, -0.5),
-              (-0.80, -1.0),
-          ]
-          for raw, expected in cases:
+          # Example: DZ 10%, full 80%.
+          expected = {
+              0.05: 0.0,
+              0.10: 0.0,
+              0.45: 0.5,
+              0.80: 1.0,
+              -0.45: -0.5,
+              -0.80: -1.0,
+          }
+          for raw, exp in expected.items():
               actual = tune(raw, 0.10, 0.80)
-              if abs(actual - expected) > 1e-7:
+              if abs(actual - exp) > 1e-7:
                   raise SystemExit(
-                      f'Analog tuning math failed: {raw} -> {actual}, '
-                      f'expected {expected}'
+                      f'V9.3.1 tuning math failed: {raw} -> {actual}, expected {exp}'
                   )
 
-          print('0% deadzone / 100% threshold = exact V9.2 behavior: OK')
-          print('10% deadzone / 80% full-threshold rescale: OK')
-          print('Signed steering symmetry: OK')
-          print('Analog tuning V9.3 verification passed.')
+          print('No nested tuning NavigationLink destinations: OK')
+          print('Inline DisclosureGroup UI: OK')
+          print('0% / 100% golden V9.2 transparency: OK')
+          print('Steering/pedal linear tuning math: OK')
+          print('V9.3.1 verification passed.')
           PY
 
       - name: Show remaining iOS 17 source markers
@@ -1734,7 +1678,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.3
+          name: ARMSX2-iOS16-unsigned-v9.3.1
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -1742,12 +1686,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.3
+          name: ARMSX2-iOS16-build-log-v9.3.1
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.3 analog-tuning build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.3 and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.3.1 analog-tuning UI-hotfix build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.3.1 and inspect the first real error.' >&2
           exit 1
