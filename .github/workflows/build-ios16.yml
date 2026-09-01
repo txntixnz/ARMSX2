@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v8.3 FFmpeg avconfig hotfix)
+name: Build ARMSX2 for iOS 16 (compat v9 GT4 analog trigger pedals)
 
 on:
   workflow_dispatch:
@@ -642,6 +642,271 @@ jobs:
           fi
           echo 'Header-only FFmpeg compatibility wiring passed.'
 
+      - name: Add GT4 analog trigger pedals
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          swift_path = Path('platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift')
+          scene_path = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
+          sdl_path = Path('pcsx2/Input/SDLInputSource.cpp')
+
+          for path in (swift_path, scene_path, sdl_path):
+              if not path.is_file():
+                  raise SystemExit(f'GT4 trigger-pedal patch: expected source file is missing: {path}')
+
+          # 1) SwiftUI setting.
+          swift_tag = '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS'
+          swift = swift_path.read_text()
+
+          if swift_tag not in swift:
+              if 'import SwiftUI' not in swift:
+                  raise SystemExit('GT4 trigger-pedal patch: GamepadSettingsView.swift no longer imports SwiftUI.')
+              if 'import Darwin' not in swift:
+                  swift = swift.replace('import SwiftUI', 'import SwiftUI\nimport Darwin', 1)
+
+              struct_anchor = 'struct GamepadSettingsView: View {'
+              if struct_anchor not in swift:
+                  raise SystemExit('GT4 trigger-pedal patch: GamepadSettingsView declaration changed upstream.')
+
+              helper = '''// ARMSX2_IOS16_GT4_TRIGGER_PEDALS
+          private func armsx2SetGT4TriggerPedalsEnvironment(_ enabled: Bool) {
+              let value = enabled ? "1" : "0"
+              "ARMSX2_GT4_TRIGGER_PEDALS".withCString { key in
+                  value.withCString { rawValue in
+                      _ = setenv(key, rawValue, 1)
+                  }
+              }
+          }
+
+          '''
+              swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
+
+              settings_pat = re.compile(
+                  r'(struct\s+GamepadSettingsView\s*:\s*View\s*\{\s*\n'
+                  r'(?:[ \t]*\n)*'
+                  r'[ \t]*@(?:State|ObservedObject)\s+private\s+var\s+settings\s*=\s*SettingsStore\.shared[^\n]*\n)'
+              )
+              match = settings_pat.search(swift)
+              if not match:
+                  raise SystemExit(
+                      'GT4 trigger-pedal patch: could not locate SettingsStore.shared after the iOS 16 Observation backport.'
+                  )
+
+              storage = (
+                  '\n    @AppStorage("ARMSX2_GT4TriggerPedals") '
+                  'private var gt4TriggerPedals = false\n'
+              )
+              swift = swift[:match.end()] + storage + swift[match.end():]
+
+              rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
+              if rumble_pos < 0:
+                  raise SystemExit('GT4 trigger-pedal patch: Tools/rumble section changed upstream.')
+              tools_section_pos = swift.rfind('Section {', 0, rumble_pos)
+              if tools_section_pos < 0:
+                  raise SystemExit('GT4 trigger-pedal patch: could not locate Tools section.')
+
+              gt4_section = '''Section {
+                      Toggle(isOn: Binding(
+                          get: { gt4TriggerPedals },
+                          set: { enabled in
+                              gt4TriggerPedals = enabled
+                              armsx2SetGT4TriggerPedalsEnvironment(enabled)
+                          }
+                      )) {
+                          Label {
+                              VStack(alignment: .leading, spacing: 3) {
+                                  Text(settings.localized("Analog Trigger Pedals"))
+                                  Text(settings.localized("R2 = Throttle · L2 = Brake"))
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                          } icon: {
+                              Image(systemName: "gauge")
+                          }
+                      }
+                  } header: {
+                      Text(settings.localized("Gran Turismo 4"))
+                  } footer: {
+                      Text(settings.localized("Uses the full analog trigger travel: R2 drives PS2 right-stick up (throttle) and L2 drives PS2 right-stick down (brake). While enabled, L2/R2 are consumed as pedal inputs instead of normal PS2 L2/R2 buttons. The physical right stick works normally when neither trigger is pressed."))
+                  }
+
+                  '''
+              swift = swift[:tools_section_pos] + gt4_section + swift[tools_section_pos:]
+              swift_path.write_text(swift)
+
+          # 2) Persist setting across cold launches.
+          scene_tag = '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_BOOT'
+          scene = scene_path.read_text()
+          if scene_tag not in scene:
+              if '#include <stdlib.h>' not in scene:
+                  ui_import = '#import <UIKit/UIKit.h>'
+                  if ui_import not in scene:
+                      raise SystemExit('GT4 trigger-pedal patch: SceneDelegate UIKit import changed upstream.')
+                  scene = scene.replace(ui_import, '#include <stdlib.h>\n\n' + ui_import, 1)
+
+              sdl_init_anchor = '// --- SDL Initialization ---'
+              pos = scene.find(sdl_init_anchor)
+              if pos < 0:
+                  raise SystemExit('GT4 trigger-pedal patch: SceneDelegate SDL initialization marker changed upstream.')
+
+              boot_code = '''// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_BOOT
+          const BOOL gt4TriggerPedalsEnabled =
+              [[NSUserDefaults standardUserDefaults] boolForKey:@"ARMSX2_GT4TriggerPedals"];
+          setenv("ARMSX2_GT4_TRIGGER_PEDALS", gt4TriggerPedalsEnabled ? "1" : "0", 1);
+          NSLog(@"[Gamepad] GT4 analog trigger pedals: %@",
+                gt4TriggerPedalsEnabled ? @"ON" : @"OFF");
+
+          '''
+              scene = scene[:pos] + boot_code + scene[pos:]
+              scene_path.write_text(scene)
+
+          # 3) Translate physical L2/R2 axes to PS2 RightY.
+          input_tag = '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT'
+          sdl = sdl_path.read_text()
+          if input_tag not in sdl:
+              if '#include <cstdlib>' not in sdl:
+                  include_anchor = '#include <cmath>'
+                  if include_anchor not in sdl:
+                      raise SystemExit('GT4 trigger-pedal patch: SDLInputSource standard includes changed upstream.')
+                  sdl = sdl.replace(include_anchor, include_anchor + '\n#include <cstdlib>', 1)
+
+              normalize_anchor = 'static float NormalizeS16(s16 value)'
+              normalize_pos = sdl.find(normalize_anchor)
+              if normalize_pos < 0:
+                  raise SystemExit('GT4 trigger-pedal patch: NormalizeS16 changed upstream.')
+
+              helper = '''// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT
+          static bool ARMSX2GT4TriggerPedalsEnabled()
+          {
+              const char* value = std::getenv("ARMSX2_GT4_TRIGGER_PEDALS");
+              return value && value[0] == '1';
+          }
+
+          '''
+              sdl = sdl[:normalize_pos] + helper + sdl[normalize_pos:]
+
+              function_anchor = 'bool SDLInputSource::HandleGamepadAxisEvent(const SDL_GamepadAxisEvent* ev)'
+              function_pos = sdl.find(function_anchor)
+              if function_pos < 0:
+                  raise SystemExit('GT4 trigger-pedal patch: HandleGamepadAxisEvent changed upstream.')
+
+              key_match = re.search(r'\n[ \t]*const InputBindingKey key\(', sdl[function_pos:])
+              if not key_match:
+                  raise SystemExit('GT4 trigger-pedal patch: normal gamepad-axis dispatch point changed upstream.')
+              key_pos = function_pos + key_match.start() + 1
+
+              pedal_block = '''\t// GT4 analog trigger-pedal mode. Trigger events are consumed here so
+          \t// they do not simultaneously reach the PS2 L2/R2 bindings.
+          \tif (ARMSX2GT4TriggerPedalsEnabled() && it->gamepad)
+          \t{
+          \t\tconst bool is_left_trigger = (ev->axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+          \t\tconst bool is_right_trigger = (ev->axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+          \t\tconst bool is_trigger = is_left_trigger || is_right_trigger;
+
+          \t\tif (is_trigger || ev->axis == SDL_GAMEPAD_AXIS_RIGHTY)
+          \t\t{
+          \t\t\ts16 left_trigger = SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+          \t\t\ts16 right_trigger = SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+
+          \t\t\tif (is_left_trigger)
+          \t\t\t\tleft_trigger = (ev->value > 0) ? ev->value : 0;
+          \t\t\telse if (is_right_trigger)
+          \t\t\t\tright_trigger = (ev->value > 0) ? ev->value : 0;
+
+          \t\t\tleft_trigger = (left_trigger > 0) ? left_trigger : 0;
+          \t\t\tright_trigger = (right_trigger > 0) ? right_trigger : 0;
+
+          \t\t\tconst bool pedals_active = (left_trigger > 0 || right_trigger > 0);
+          \t\t\tif (is_trigger || pedals_active)
+          \t\t\t{
+          \t\t\t\tfloat synthetic_right_y;
+          \t\t\t\tif (pedals_active)
+          \t\t\t\t{
+          \t\t\t\t\t// R2 -> negative/right-stick UP (throttle)
+          \t\t\t\t\t// L2 -> positive/right-stick DOWN (brake)
+          \t\t\t\t\tsynthetic_right_y =
+          \t\t\t\t\t\tstatic_cast<float>(static_cast<int>(left_trigger) -
+          \t\t\t\t\t\t                   static_cast<int>(right_trigger)) /
+          \t\t\t\t\t\t32767.0f;
+          \t\t\t\t}
+          \t\t\t\telse
+          \t\t\t\t{
+          \t\t\t\t\t// Both pedals were just released. Restore physical RightY.
+          \t\t\t\t\tsynthetic_right_y =
+          \t\t\t\t\t\tNormalizeS16(SDL_GetGamepadAxis(it->gamepad, SDL_GAMEPAD_AXIS_RIGHTY));
+          \t\t\t\t}
+
+          \t\t\t\tconst InputBindingKey right_y_key(
+          \t\t\t\t\tMakeGenericControllerAxisKey(
+          \t\t\t\t\t\tInputSourceType::SDL, it->player_id, SDL_GAMEPAD_AXIS_RIGHTY));
+          \t\t\t\tInputManager::InvokeEvents(
+          \t\t\t\t\tright_y_key, synthetic_right_y, GenericInputBinding::Unknown,
+          \t\t\t\t\ts_sdl_generic_binding_axis_mapping[SDL_GAMEPAD_AXIS_RIGHTY][0],
+          \t\t\t\t\ts_sdl_generic_binding_axis_mapping[SDL_GAMEPAD_AXIS_RIGHTY][1]);
+          \t\t\t\treturn true;
+          \t\t\t}
+          \t\t}
+          \t}
+
+          '''
+              sdl = sdl[:key_pos] + pedal_block + sdl[key_pos:]
+              sdl_path.write_text(sdl)
+
+          print('GT4 analog trigger-pedal feature patched successfully.')
+          print(f'  Swift UI: {swift_path}')
+          print(f'  Cold-launch persistence: {scene_path}')
+          print(f'  SDL analog translation: {sdl_path}')
+          PY
+
+      - name: Verify GT4 analog trigger pedals
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo 'Game Controller UI wiring:'
+          grep -n -A40 -B5 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          echo
+
+          echo 'Cold-launch preference wiring:'
+          grep -n -A10 -B3 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_BOOT' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          echo
+
+          echo 'SDL analog translation wiring:'
+          grep -n -A95 -B5 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_INPUT' \
+            pcsx2/Input/SDLInputSource.cpp
+          echo
+
+          python3 - <<'PY'
+          def right_y(l2: int, r2: int) -> float:
+              l2 = max(0, min(32767, l2))
+              r2 = max(0, min(32767, r2))
+              return (l2 - r2) / 32767.0
+
+          tests = [
+              ('released',     0,     0,      0.0),
+              ('R2 full',      0, 32767,     -1.0),
+              ('L2 full',  32767,     0,      1.0),
+              ('R2 half',      0, 16384, -16384 / 32767.0),
+              ('L2 half',  16384,     0,  16384 / 32767.0),
+              ('both equal', 12000, 12000,     0.0),
+          ]
+
+          for name, l2, r2, expected in tests:
+              actual = right_y(l2, r2)
+              if abs(actual - expected) > 1e-6:
+                  raise SystemExit(f'GT4 pedal math failed: {name}: expected {expected}, got {actual}')
+              print(f'  {name:10s} L2={l2:5d} R2={r2:5d} -> RightY={actual:+.4f}')
+
+          print('Direction contract: R2 -> RightStickUp/throttle; L2 -> RightStickDown/brake')
+          print('GT4 analog trigger-pedal verification passed.')
+          PY
+
       - name: Show remaining iOS 17 source markers
         shell: bash
         run: |
@@ -677,7 +942,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v8.3
+          name: ARMSX2-iOS16-unsigned-v9-gt4
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -685,12 +950,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v8.3
+          name: ARMSX2-iOS16-build-log-v9-gt4
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V8.1 build reached another compiler/linker blocker after resolving and injecting FFmpeg development headers. Download ARMSX2-iOS16-build-log-v8.3 and inspect the first real error.' >&2
+          echo 'The iOS 16 V9 GT4 trigger-pedal build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9-gt4 and inspect the first real error.' >&2
           exit 1
