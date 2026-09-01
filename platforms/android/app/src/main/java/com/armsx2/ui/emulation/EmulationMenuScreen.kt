@@ -745,10 +745,47 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
         ) { _ -> com.armsx2.ui.QuickMenuSide.set(!menuSide) }
     }
     SectionCard(str("savestate.title.loadManage")) {
+        // When each slot was last written. Ten chips numbered 1..10 say nothing about which
+        // hold anything or how old they are, so picking a slot to overwrite after a long
+        // session was guesswork -- the Save Manager has had the dates all along, but the quick
+        // picker is where the choice actually gets made. Read off disk once per menu open;
+        // SaveSlotLookup is blocking, hence produceState rather than a composition-time call.
+        // ★ getGamePathSlot, NOT SaveSlotLookup.
+        //
+        // SaveSlotLookup exists for the LIBRARY, where nothing is booted and the only way to
+        // find states is to match `<serial> (title).NN.p2s` on disk. In here a VM is running, so
+        // the native side already knows the exact path for each slot — and it is authoritative
+        // where the filename match is a guess that silently returns nothing when the serial is
+        // absent or formatted differently, which is what made this show "Empty" for every slot.
+        val slotStamps by androidx.compose.runtime.produceState(
+            // Re-read when the menu's slot selection changes, which is the only thing that
+            // happens in here after a save; a save also bumps the file, and the menu is short-
+            // lived enough that one read per open is the right granularity.
+            initialValue = emptyMap<Int, Long>(), state.saveSlot,
+        ) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    (0..9).mapNotNull { slot ->
+                        val path = kr.co.iefriends.pcsx2.NativeApp.getGamePathSlot(slot)
+                        if (path.isNullOrBlank()) return@mapNotNull null
+                        val f = java.io.File(path)
+                        if (f.isFile && f.lastModified() > 0L) slot to f.lastModified() else null
+                    }.toMap()
+                }.getOrDefault(emptyMap())
+            }
+        }
         Text(
             "${str("memcard.slot1").substringBefore(' ')} ${state.saveSlot + 1}",
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            slotStamps[state.saveSlot]?.let {
+                java.text.SimpleDateFormat("d MMM yyyy, HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(it))
+            } ?: str("savestate.slot.empty"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(8.dp))
         Row(
@@ -761,7 +798,9 @@ private fun SessionPane(state: EmulationMenuUiState, viewModel: EmulationMenuVie
         ) {
             repeat(10) { slot ->
                 OptionChip(
-                    label = "${slot + 1}",
+                    // A dot marks a slot that holds something, so the row shows what is used
+                    // without having to select each one to find out.
+                    label = if (slotStamps.containsKey(slot)) "${slot + 1} •" else "${slot + 1}",
                     selected = slot == state.saveSlot,
                     controllerId = "pause.saveslot.$slot",
                     onClick = { viewModel.setSaveSlot(slot) },

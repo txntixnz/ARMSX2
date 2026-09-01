@@ -517,7 +517,6 @@ endif()
 
 set(pcsx2GSSources
 	GS/GS.cpp
-	GS/GSCapture.cpp
 	GS/GSClut.cpp
 	GS/GSDrawingContext.cpp
 	GS/GSDrawingEnvironment.cpp
@@ -634,6 +633,18 @@ elseif(ARCH_ARM64)
 		GS/GSVector4_arm64.h
 		GS/GSVector4i_arm64.h
 	)
+endif()
+
+# Video capture, and with it the only thing in the tree that needs ffmpeg's headers. Not built on
+# Android: the platform records the screen better than we can from in here, and a gsdump in
+# RenderDoc is the more useful artefact anyway. GSCapture.h supplies inline no-op stubs there, so
+# no call site changes and nothing else notices.
+#
+# Keeping ffmpeg out also stops upstream's 2.9.x header removal from becoming our problem -- it
+# deletes 3rdparty/ffmpeg/include, which the NDK cannot replace, so the alternative was vendoring
+# ffmpeg per-ABI to keep compiling a feature no Android user can reach.
+if(NOT ANDROID)
+	list(APPEND pcsx2GSSources GS/GSCapture.cpp)
 endif()
 
 if(USE_OPENGL)
@@ -1437,6 +1448,7 @@ target_include_directories(PCSX2_FLAGS INTERFACE
 	"${CMAKE_CURRENT_SOURCE_DIR}"
 	"${CMAKE_BINARY_DIR}/pcsx2"
 	"${CMAKE_BINARY_DIR}/common/include"
+	# Empty on Android by design -- see the GSCapture.cpp exclusion above.
 	"${FFMPEG_INCLUDE_DIRS}"
 )
 
@@ -1609,10 +1621,17 @@ function(setup_main_executable target)
 			install(FILES "${DEPS_BINDIR}/${DEP_TO_COPY}" DESTINATION "${CMAKE_SOURCE_DIR}/bin")
 		endforeach()
 
-		set(OPT_DEPS_TO_COPY avcodec-62.dll avformat-62.dll avutil-60.dll swresample-6.dll swscale-9.dll)
-		foreach(OPT_DEP_TO_COPY ${OPT_DEPS_TO_COPY})
-			install(FILES "${DEPS_BINDIR}/${OPT_DEP_TO_COPY}" DESTINATION "${CMAKE_SOURCE_DIR}/bin" OPTIONAL)
-		endforeach()
+		file(GLOB OPT_DEPS_FULL_PATHS
+			"${DEPS_BINDIR}/avcodec-*.dll"
+			"${DEPS_BINDIR}/avformat-*.dll"
+			"${DEPS_BINDIR}/avutil-*.dll"
+			"${DEPS_BINDIR}/swscale-*.dll"
+			"${DEPS_BINDIR}/swresample-*.dll"
+		)
+		install(FILES ${OPT_DEPS_FULL_PATHS} DESTINATION "${CMAKE_SOURCE_DIR}/bin" OPTIONAL)
+
+		set(OPT_DEPS_TO_COPY ${OPT_DEPS_FULL_PATHS})
+		list(TRANSFORM OPT_DEPS_TO_COPY REPLACE "^.*/" "")
 
 		set(SYMBOLS_TO_COPY ${DEPS_TO_COPY} ${OPT_DEPS_TO_COPY})
 		list(TRANSFORM SYMBOLS_TO_COPY REPLACE "[.]dll" ".pdb")
