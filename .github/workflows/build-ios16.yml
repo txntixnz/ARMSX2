@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v6 Observation singleton fix)
+name: Build ARMSX2 for iOS 16 (compat v7 exact singleton Observation fix)
 
 on:
   workflow_dispatch:
@@ -203,11 +203,14 @@ jobs:
                   # tracks replacement of the reference and does NOT subscribe to objectWillChange.
                   # This is exactly the menu->game symptom seen in the field: the VM starts and
                   # audio runs, but SwiftUI never redraws RootView to present gameplay.
-                  # For singleton references, @ObservedObject is the correct iOS 16 equivalent.
+                  # For a DIRECT singleton reference, @ObservedObject is the correct iOS 16 equivalent.
+                  # Important: do not match member values such as
+                  # `SettingsStore.shared.dynamicAppearancePreferences`; that value is not
+                  # necessarily an ObservableObject and must keep its original wrapper.
                   shared_pat = re.compile(
                       r'@State(?P<mods>\s+(?:(?:private|fileprivate|internal|public)\s+)?)'
                       r'var(?P<body>\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*' + re.escape(cls) + r')?\s*=\s*'
-                      + re.escape(cls) + r'\.shared\b)'
+                      + re.escape(cls) + r'\.shared\b(?=[ \t]*(?://[^\n]*)?(?:\n|$))')
                   )
                   text, c = shared_pat.subn(
                       lambda m: '@ObservedObject' + (m.group('mods') or ' ') + 'var' + m.group('body'),
@@ -250,7 +253,7 @@ jobs:
               # Any leftover Observation-style @State singleton ref would not subscribe
               # to ObservableObject.objectWillChange on iOS 16.
               for n, line in enumerate(text.splitlines(), 1):
-                  if re.search(r'@State\b[^\n]*=\s*(?:AppState|SettingsStore|DynamicThumbstickSettings|EmulatorBridge|ExternalGameLibrary|PatchStore|FrameTimeDynamicResolutionController|InitialContentBootstrap|VPadSkinLibraryStore|PadLayoutPresetStore|PadLayoutStore|CoverStore|FileImportHandler)\.shared\b', line):
+                  if re.search(r'@State\b[^\n]*=\s*(?:AppState|SettingsStore|DynamicThumbstickSettings|EmulatorBridge|ExternalGameLibrary|PatchStore|FrameTimeDynamicResolutionController|InitialContentBootstrap|VPadSkinLibraryStore|PadLayoutPresetStore|PadLayoutStore|CoverStore|FileImportHandler)\.shared\b[ \t]*(?://.*)?$', line):
                       problems.append(f'{path}:{n}: unconverted singleton @State: {line.strip()}')
                   if 'AppState.shared' in line and ('@ObservedObject' in line or '@StateObject' in line):
                       interesting.append(f'{path}:{n}: {line.strip()}')
@@ -261,6 +264,20 @@ jobs:
                   print('  ' + item)
           else:
               print('  (no wrapped AppState.shared properties found)')
+
+          # Regression guard for the V6 compiler failure. The singleton conversion must
+          # never consume a child value merely because its initializer begins with
+          # `SettingsStore.shared`.
+          appearance_path = root / 'Views' / 'Settings' / 'AppearanceSettingsView.swift'
+          if appearance_path.exists():
+              for n, line in enumerate(appearance_path.read_text().splitlines(), 1):
+                  if 'dynamicAppearancePreferences' in line:
+                      print(f'Appearance preference wiring: {appearance_path}:{n}: {line.strip()}')
+                      if ('@ObservedObject' in line or '@StateObject' in line) and 'SettingsStore.shared.dynamicAppearancePreferences' in line:
+                          problems.append(
+                              f'{appearance_path}:{n}: V6 regression: child value '
+                              'SettingsStore.shared.dynamicAppearancePreferences was wrapped as ObservableObject'
+                          )
 
           if problems:
               print('\nERROR: Observation backport verification failed:')
@@ -500,7 +517,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v6
+          name: ARMSX2-iOS16-unsigned-v7
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -508,12 +525,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v6
+          name: ARMSX2-iOS16-build-log-v7
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V6 Observation-singleton pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v6 and inspect the first real error.' >&2
+          echo 'The iOS 16 V7 exact-singleton Observation pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v7 and inspect the first real error.' >&2
           exit 1
