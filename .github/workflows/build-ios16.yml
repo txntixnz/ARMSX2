@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v8.1 FFmpeg headers hotfix)
+name: Build ARMSX2 for iOS 16 (compat v8.2 pinned FFmpeg headers hotfix)
 
 on:
   workflow_dispatch:
@@ -487,68 +487,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
 
-          python3 - <<'PY'
-          from pathlib import Path
+          # Current ARMSX2/PCSX2 GSCapture.cpp includes FFmpeg API headers even
+          # when USE_LINKED_FFMPEG is disabled.  The iOS build does not need
+          # FFmpeg at runtime for normal emulation, but the compiler still needs
+          # a complete API header tree.
+          #
+          # Do NOT use Homebrew headers/libraries here:
+          # - runner images can expose an incomplete/unexpected keg layout;
+          # - Homebrew libraries are macOS binaries and must never be linked
+          #   into an iPhoneOS target.
+          #
+          # Instead use a pinned upstream FFmpeg source tree as HEADER-ONLY input.
+          FFMPEG_TAG="n7.1.5"
+          FFMPEG_ARCHIVE="/tmp/ffmpeg-${FFMPEG_TAG}.tar.gz"
+          FFMPEG_WORK="/tmp/armsx2-ffmpeg-src"
 
-          required_rel = [
-              Path('libavcodec/avcodec.h'),
-              Path('libavformat/avformat.h'),
-              Path('libavutil/avutil.h'),
-              Path('libswresample/swresample.h'),
-              Path('libswscale/swscale.h'),
-          ]
+          rm -rf "$FFMPEG_WORK" "$FFMPEG_ARCHIVE"
+          mkdir -p "$FFMPEG_WORK"
 
-          candidates = [
-              Path('3rdparty/ffmpeg/include'),
-              Path('3rdparty/ffmpeg'),
-              Path('deps/include'),
-              Path('pcsx2-deps/include'),
-          ]
+          echo "Downloading pinned FFmpeg source headers: ${FFMPEG_TAG}"
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/${FFMPEG_TAG}" \
+            -o "$FFMPEG_ARCHIVE"
 
-          resolved = None
-          for candidate in candidates:
-              if all((candidate / rel).is_file() for rel in required_rel):
-                  resolved = candidate.resolve()
-                  break
+          tar -xzf "$FFMPEG_ARCHIVE" -C "$FFMPEG_WORK" --strip-components=1
 
-          if resolved is not None:
-              print(f'Found complete FFmpeg headers in checkout: {resolved}')
-              Path('/tmp/armsx2_ffmpeg_include').write_text(str(resolved))
-          else:
-              print('No complete FFmpeg development header set exists in the checkout.')
-              print('The new PCSX2 GSCapture source needs headers even when FFmpeg is not linked.')
-          PY
+          FFMPEG_INCLUDE_ROOT="$FFMPEG_WORK"
 
-          if [ ! -s /tmp/armsx2_ffmpeg_include ]; then
-            echo 'Installing Homebrew FFmpeg only to obtain compatible development headers...'
-            if ! command -v brew >/dev/null 2>&1; then
-              echo 'ERROR: Homebrew is not available on this GitHub macOS runner.' >&2
-              exit 1
-            fi
-
-            if ! brew --prefix ffmpeg >/dev/null 2>&1; then
-              brew install ffmpeg
-            fi
-
-            FFMPEG_PREFIX="$(brew --prefix ffmpeg)"
-            FFMPEG_INCLUDE_ROOT="$FFMPEG_PREFIX/include"
-            printf '%s' "$FFMPEG_INCLUDE_ROOT" > /tmp/armsx2_ffmpeg_include
-          fi
-
-          FFMPEG_INCLUDE_ROOT="$(cat /tmp/armsx2_ffmpeg_include)"
-          echo "Resolved FFmpeg include root: $FFMPEG_INCLUDE_ROOT"
-
+          echo "Resolved FFmpeg header root: $FFMPEG_INCLUDE_ROOT"
           for h in \
             libavcodec/avcodec.h \
+            libavcodec/version.h \
             libavformat/avformat.h \
+            libavformat/version.h \
             libavutil/avutil.h \
+            libavutil/version.h \
             libswresample/swresample.h \
-            libswscale/swscale.h
+            libswresample/version.h \
+            libswscale/swscale.h \
+            libswscale/version.h
           do
             test -f "$FFMPEG_INCLUDE_ROOT/$h" || {
-              echo "ERROR: Missing required FFmpeg header: $FFMPEG_INCLUDE_ROOT/$h" >&2
+              echo "ERROR: Pinned FFmpeg source tree is missing required header: $FFMPEG_INCLUDE_ROOT/$h" >&2
               exit 1
             }
             echo "  OK $FFMPEG_INCLUDE_ROOT/$h"
@@ -576,11 +557,11 @@ jobs:
           ]
           missing = [str(p) for p in required if not p.is_file()]
           if missing:
-              raise SystemExit('Resolved FFmpeg include root is incomplete:\\n  ' + '\\n  '.join(missing))
+              raise SystemExit('Resolved FFmpeg header root is incomplete:\\n  ' + '\\n  '.join(missing))
 
           text = cmake.read_text()
           marker = 'add_subdirectory(${ARMSX2_ROOT}/pcsx2 ${CMAKE_BINARY_DIR}/pcsx2)'
-          tag = '# ARMSX2_IOS16_FFMPEG_HEADERS_V81'
+          tag = '# ARMSX2_IOS16_FFMPEG_HEADERS_V82'
 
           if tag not in text:
               if marker not in text:
@@ -592,10 +573,9 @@ jobs:
               inc = include_root.as_posix()
               replacement = '\n'.join([
                   tag,
-                  '# Updated PCSX2 GSCapture.cpp now includes FFmpeg headers unconditionally.',
-                  '# iOS still uses the non-linked FFmpeg path, so expose DEVELOPMENT HEADERS only.',
-                  '# Do not set USE_LINKED_FFMPEG here: Homebrew libraries are macOS binaries,',
-                  '# not iPhoneOS libraries, and must never be linked into the IPA.',
+                  '# Updated PCSX2 GSCapture.cpp includes FFmpeg headers unconditionally.',
+                  '# Supply a pinned FFmpeg SOURCE TREE as compile-only headers for iOS.',
+                  '# Do not set USE_LINKED_FFMPEG: no host/macOS FFmpeg library may enter the IPA.',
                   f'set(FFMPEG_INCLUDE_DIRS "{inc}")',
                   f'include_directories(BEFORE "{inc}")',
                   '',
@@ -613,27 +593,33 @@ jobs:
           if tag not in patched:
               raise SystemExit('FFmpeg iOS 16 compatibility marker was not written.')
           if include_root.as_posix() not in patched:
-              raise SystemExit('Resolved FFmpeg include path was not wired into the iOS CMake build.')
-          if 'USE_LINKED_FFMPEG' in replacement if 'replacement' in locals() else False:
-              raise SystemExit('Internal guard: V8.1 must not enable linked Homebrew FFmpeg.')
+              raise SystemExit('Resolved FFmpeg header path was not wired into the iOS CMake build.')
 
-          print(f'Injected header-only FFmpeg include path: {include_root}')
+          # Guard against accidentally linking runner-host FFmpeg.
+          added_region = patched[patched.index(tag):patched.index(tag) + 1400]
+          if re_search := __import__('re').search(r'\bset\s*\(\s*USE_LINKED_FFMPEG\b|\btarget_link_libraries\b[^\n]*FFMPEG::', added_region):
+              raise SystemExit(f'Internal guard: V8.2 must remain header-only; found linked FFmpeg wiring: {re_search.group(0)}')
+
+          print(f'Injected pinned header-only FFmpeg include path: {include_root}')
           PY
 
       - name: Verify FFmpeg header-only compatibility patch
         shell: bash
         run: |
           set -euo pipefail
-          echo "FFmpeg include root: $FFMPEG_INCLUDE_ROOT"
+          echo "FFmpeg header root: $FFMPEG_INCLUDE_ROOT"
           ls -l "$FFMPEG_INCLUDE_ROOT/libavcodec/avcodec.h"
           echo
           echo 'iOS CMake FFmpeg wiring:'
-          grep -n -A20 -B3 'ARMSX2_IOS16_FFMPEG_HEADERS_V81' platforms/ios/app/src/main/cpp/CMakeLists.txt
+          grep -n -A20 -B3 'ARMSX2_IOS16_FFMPEG_HEADERS_V82' platforms/ios/app/src/main/cpp/CMakeLists.txt
           echo
-          if grep -n 'set *(USE_LINKED_FFMPEG' platforms/ios/app/src/main/cpp/CMakeLists.txt; then
-            echo 'ERROR: iOS compatibility patch must not enable linked Homebrew FFmpeg.' >&2
+          echo 'Checking that the compatibility patch did not enable linked FFmpeg...'
+          if grep -nE 'set[[:space:]]*\([[:space:]]*USE_LINKED_FFMPEG|target_link_libraries.*FFMPEG::' \
+              platforms/ios/app/src/main/cpp/CMakeLists.txt; then
+            echo 'ERROR: iOS compatibility patch must not enable linked FFmpeg.' >&2
             exit 1
           fi
+          echo 'Header-only FFmpeg compatibility wiring passed.'
 
       - name: Show remaining iOS 17 source markers
         shell: bash
@@ -670,7 +656,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v8.1
+          name: ARMSX2-iOS16-unsigned-v8.2
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -678,12 +664,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v8.1
+          name: ARMSX2-iOS16-build-log-v8.2
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V8.1 build reached another compiler/linker blocker after resolving and injecting FFmpeg development headers. Download ARMSX2-iOS16-build-log-v8.1 and inspect the first real error.' >&2
+          echo 'The iOS 16 V8.1 build reached another compiler/linker blocker after resolving and injecting FFmpeg development headers. Download ARMSX2-iOS16-build-log-v8.2 and inspect the first real error.' >&2
           exit 1
