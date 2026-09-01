@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v7.2 exact singleton hotfix)
+name: Build ARMSX2 for iOS 16 (compat v8 upstream FFmpeg fix)
 
 on:
   workflow_dispatch:
@@ -482,6 +482,83 @@ jobs:
               print(f'  {k}: {v}')
           PY
 
+      - name: Patch upstream FFmpeg headers for iOS core
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake = Path('platforms/ios/app/src/main/cpp/CMakeLists.txt')
+          ffmpeg_root = Path('3rdparty/ffmpeg/include')
+          required_headers = [
+              ffmpeg_root / 'libavcodec/avcodec.h',
+              ffmpeg_root / 'libavformat/avformat.h',
+              ffmpeg_root / 'libavutil/avutil.h',
+              ffmpeg_root / 'libswresample/swresample.h',
+              ffmpeg_root / 'libswscale/swscale.h',
+          ]
+
+          missing = [str(p) for p in required_headers if not p.is_file()]
+          if missing:
+              raise SystemExit(
+                  'Bundled FFmpeg headers expected by the updated PCSX2 GSCapture core are missing:\\n  '
+                  + '\\n  '.join(missing)
+              )
+
+          text = cmake.read_text()
+          marker = 'add_subdirectory(${ARMSX2_ROOT}/pcsx2 ${CMAKE_BINARY_DIR}/pcsx2)'
+          tag = '# ARMSX2_IOS16_FFMPEG_HEADERS'
+
+          if tag not in text:
+              if marker not in text:
+                  raise SystemExit(
+                      'Could not find the PCSX2 add_subdirectory marker in the iOS CMakeLists.txt; '
+                      'upstream changed build wiring and this compatibility patch must be reviewed.'
+                  )
+
+              replacement = '''# ARMSX2_IOS16_FFMPEG_HEADERS
+          # Newer PCSX2 GSCapture.cpp includes FFmpeg headers. Desktop SearchForStuff
+          # falls back to these bundled headers when FFmpeg is unavailable, but the
+          # iOS-local dependency setup does not currently publish that include path.
+          # Keep this compile-only fallback local to the iOS build.
+          set(FFMPEG_INCLUDE_DIRS "${ARMSX2_ROOT}/3rdparty/ffmpeg/include")
+          include_directories(BEFORE "${ARMSX2_ROOT}/3rdparty/ffmpeg/include")
+
+          add_subdirectory(${ARMSX2_ROOT}/pcsx2 ${CMAKE_BINARY_DIR}/pcsx2)
+
+          # Also attach the include directory through the shared PCSX2 flags target
+          # when available, so PCSX2_LTO receives it even if upstream directory
+          # include inheritance changes later.
+          if(TARGET PCSX2_FLAGS)
+              target_include_directories(PCSX2_FLAGS INTERFACE
+                  "${ARMSX2_ROOT}/3rdparty/ffmpeg/include"
+              )
+          endif()
+          '''
+              text = text.replace(marker, replacement, 1)
+              cmake.write_text(text)
+
+          patched = cmake.read_text()
+          if tag not in patched:
+              raise SystemExit('FFmpeg iOS compatibility marker was not written.')
+          if '${ARMSX2_ROOT}/3rdparty/ffmpeg/include' not in patched:
+              raise SystemExit('FFmpeg include path was not wired into the iOS CMake build.')
+
+          print('Bundled FFmpeg header fallback is present:')
+          for p in required_headers:
+              print('  OK', p)
+          print('Injected FFmpeg include wiring around the PCSX2 iOS subdirectory.')
+          PY
+
+      - name: Verify FFmpeg compatibility patch
+        shell: bash
+        run: |
+          echo 'FFmpeg header:'
+          ls -l 3rdparty/ffmpeg/include/libavcodec/avcodec.h
+          echo
+          echo 'iOS CMake FFmpeg wiring:'
+          grep -n -A18 -B2 'ARMSX2_IOS16_FFMPEG_HEADERS' platforms/ios/app/src/main/cpp/CMakeLists.txt
+
       - name: Show remaining iOS 17 source markers
         shell: bash
         run: |
@@ -517,7 +594,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v7.2
+          name: ARMSX2-iOS16-unsigned-v8
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -525,12 +602,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v7.2
+          name: ARMSX2-iOS16-build-log-v8
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V7.2 exact-singleton Observation pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v7.2 and inspect the first real error.' >&2
+          echo 'The iOS 16 V8 build reached another compiler/linker blocker after the upstream FFmpeg-header compatibility patch. Download ARMSX2-iOS16-build-log-v8 and inspect the first real error.' >&2
           exit 1
