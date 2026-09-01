@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v7 exact singleton Observation fix)
+name: Build ARMSX2 for iOS 16 (compat v7.2 exact singleton hotfix)
 
 on:
   workflow_dispatch:
@@ -210,7 +210,7 @@ jobs:
                   shared_pat = re.compile(
                       r'@State(?P<mods>\s+(?:(?:private|fileprivate|internal|public)\s+)?)'
                       r'var(?P<body>\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*' + re.escape(cls) + r')?\s*=\s*'
-                      + re.escape(cls) + r'\.shared\b(?=[ \t]*(?://[^\n]*)?(?:\n|$))')
+                      + re.escape(cls) + r'\.shared\b(?=[ \t]*(?://[^\n]*)?(?:\n|$)))'
                   )
                   text, c = shared_pat.subn(
                       lambda m: '@ObservedObject' + (m.group('mods') or ' ') + 'var' + m.group('body'),
@@ -517,7 +517,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v7
+          name: ARMSX2-iOS16-unsigned-v7.2
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -525,12 +525,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v7
+          name: ARMSX2-iOS16-build-log-v7.2
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V7 exact-singleton Observation pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v7 and inspect the first real error.' >&2
+          echo 'The iOS 16 V7.2 exact-singleton Observation pass reached another compiler/linker blocker. Download ARMSX2-iOS16-build-log-v7.2 and inspect the first real error.' >&2
           exit 1
