@@ -1,0 +1,125 @@
+name: Sync upstream ARMSX2 + build iOS 16
+
+on:
+  schedule:
+    # Every 6 hours. The cheap Linux sync check runs each time; the macOS iOS
+    # build is dispatched only when upstream/master actually changed.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build iOS 16 even if the fork is already synced'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: armsx2-upstream-sync-ios16
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ARMSX2 upstream master
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork master with full history
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/ARMSX2/ARMSX2.git
+          git fetch --prune upstream master
+
+      - name: Check for upstream changes and merge safely
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOCAL_BEFORE="$(git rev-parse HEAD)"
+          UPSTREAM_HEAD="$(git rev-parse upstream/master)"
+
+          echo "local_before=$LOCAL_BEFORE" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$UPSTREAM_HEAD" >> "$GITHUB_OUTPUT"
+
+          echo "Fork master before sync: $LOCAL_BEFORE"
+          echo "Upstream master:          $UPSTREAM_HEAD"
+
+          # Our iOS 16 compatibility workflow is fork-owned. If upstream ever
+          # starts shipping a file at the same path, stop instead of risking an
+          # automatic overwrite/conflict of the known-good iOS 16 workflow.
+          if git cat-file -e upstream/master:.github/workflows/build-ios16.yml 2>/dev/null; then
+            echo "ERROR: upstream now contains .github/workflows/build-ios16.yml." >&2
+            echo "Refusing automatic sync so the custom iOS 16 workflow cannot be overwritten." >&2
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$UPSTREAM_HEAD" HEAD; then
+            echo "Fork already contains the current upstream master. Nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "local_after=$LOCAL_BEFORE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Merge rather than reset/rebase so fork-only commits, especially the
+          # iOS 16 workflow, are preserved.
+          if ! git merge --no-ff --no-edit upstream/master -m "Sync ARMSX2 upstream/master"; then
+            echo "ERROR: upstream merge conflict. No partial merge will be pushed." >&2
+            git status --short || true
+            git diff --name-only --diff-filter=U || true
+            git merge --abort || true
+            exit 1
+          fi
+
+          # Guardrail: never push a sync that lost our custom build workflow.
+          if [ ! -f .github/workflows/build-ios16.yml ]; then
+            echo "ERROR: custom .github/workflows/build-ios16.yml disappeared during sync." >&2
+            exit 1
+          fi
+
+          LOCAL_AFTER="$(git rev-parse HEAD)"
+          echo "local_after=$LOCAL_AFTER" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          echo "Merged upstream successfully: $LOCAL_AFTER"
+          git push origin HEAD:master
+
+      - name: Dispatch the iOS 16 compatibility build
+        if: steps.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Dispatching .github/workflows/build-ios16.yml on current master..."
+          gh workflow run build-ios16.yml --ref master
+
+          echo "### ARMSX2 upstream sync" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Previous fork head: \`${{ steps.sync.outputs.local_before }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Upstream head: \`${{ steps.sync.outputs.upstream_head }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Synced fork head: \`${{ steps.sync.outputs.local_after }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- iOS 16 compatibility build: **dispatched**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary when already current and no build requested
+        if: steps.sync.outputs.changed == 'false' && !(github.event_name == 'workflow_dispatch' && inputs.force_build)
+        shell: bash
+        run: |
+          echo "### ARMSX2 upstream sync" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fork is already up to date with upstream/master." >> "$GITHUB_STEP_SUMMARY"
+          echo "No macOS iOS build was started." >> "$GITHUB_STEP_SUMMARY"
