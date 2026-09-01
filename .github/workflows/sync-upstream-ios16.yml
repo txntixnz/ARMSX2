@@ -1,4 +1,4 @@
-name: Sync upstream ARMSX2 + build iOS 16
+name: Sync upstream ARMSX2 + build iOS 16 (v2)
 
 on:
   schedule:
@@ -107,8 +107,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Dispatching .github/workflows/build-ios16.yml on current master..."
-          gh workflow run build-ios16.yml --ref master
+          echo "Dispatching .github/workflows/build-ios16.yml in fork: $GITHUB_REPOSITORY"
+          gh workflow run build-ios16.yml --repo "$GITHUB_REPOSITORY" --ref master
 
           echo "### ARMSX2 upstream sync" >> "$GITHUB_STEP_SUMMARY"
           echo "- Previous fork head: \`${{ steps.sync.outputs.local_before }}\`" >> "$GITHUB_STEP_SUMMARY"
