@@ -1,14 +1,13 @@
-name: Sync upstream ARMSX2 + build iOS 16 (v3 workflow-safe)
+name: Sync upstream ARMSX2 + build iOS 16 (v4 revision-tracked)
 
 on:
   schedule:
-    # Every 6 hours. The cheap Linux sync check runs each time; the macOS iOS
-    # build is dispatched only when upstream/master actually changed.
+    # Check upstream/master every 6 hours.
     - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'Build iOS 16 even if the fork is already synced'
+        description: 'Build iOS 16 even if this upstream revision was already built'
         required: true
         default: true
         type: boolean
@@ -23,7 +22,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync ARMSX2 upstream master
+    name: Track latest ARMSX2 upstream revision
     runs-on: ubuntu-latest
 
     steps:
@@ -42,15 +41,18 @@ jobs:
       - name: Fetch upstream
         shell: bash
         run: |
+          set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/ARMSX2/ARMSX2.git
           git fetch --prune upstream master
 
-      - name: Check for upstream source changes and sync safely
+      - name: Compare upstream revision and sync source safely
         id: sync
         shell: bash
         run: |
           set -euo pipefail
+
+          MARKER_FILE=".armsx2-ios16-last-built-upstream"
 
           LOCAL_BEFORE="$(git rev-parse HEAD)"
           UPSTREAM_HEAD="$(git rev-parse upstream/master)"
@@ -61,49 +63,90 @@ jobs:
           echo "Fork master before sync: $LOCAL_BEFORE"
           echo "Upstream master:          $UPSTREAM_HEAD"
 
-          # The fork owns .github/workflows.  GitHub's built-in Actions token
-          # cannot push commits which introduce/update workflow files from
-          # upstream, so never import upstream's workflow directory.
+          # -----------------------------------------------------------------
+          # Fork-owned paths.
           #
-          # This also protects:
-          #   .github/workflows/build-ios16.yml
-          #   .github/workflows/sync-upstream-ios16.yml
+          # We intentionally never mirror upstream's workflow directory.
+          # GitHub's built-in Actions token can be rejected when a GitHub App
+          # tries to push upstream workflow-file changes into the fork.
           #
-          # All non-workflow repository files are mirrored to upstream/master.
+          # V4 also owns one tiny root marker file which remembers the exact
+          # upstream/master SHA most recently dispatched to build-ios16.yml.
+          # -----------------------------------------------------------------
+          for fork_owned in \
+            .github/workflows/build-ios16.yml \
+            .github/workflows/sync-upstream-ios16.yml \
+            "$MARKER_FILE"
+          do
+            if git cat-file -e "upstream/master:$fork_owned" 2>/dev/null; then
+              echo "ERROR: upstream now contains fork-owned path: $fork_owned" >&2
+              echo "Stopping for manual review instead of overwriting fork-owned state." >&2
+              exit 1
+            fi
+          done
 
-          if git cat-file -e upstream/master:.github/workflows/build-ios16.yml 2>/dev/null; then
-            echo "ERROR: upstream now contains .github/workflows/build-ios16.yml." >&2
-            echo "Stopping so the fork-owned iOS 16 workflow can be reviewed manually." >&2
-            exit 1
+          LAST_BUILT=""
+          if [ -f "$MARKER_FILE" ]; then
+            LAST_BUILT="$(tr -d '[:space:]' < "$MARKER_FILE")"
           fi
 
-          # Compare only the part of the tree we actually mirror.
-          if git diff --quiet HEAD upstream/master -- . ':(exclude).github/workflows/**'; then
-            echo "Fork source already matches current upstream/master."
-            echo "Upstream workflow-only differences, if any, are intentionally ignored."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [ -n "$LAST_BUILT" ] && ! printf '%s' "$LAST_BUILT" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "WARNING: $MARKER_FILE contains an invalid SHA; treating it as unset."
+            LAST_BUILT=""
+          fi
+
+          if [ -n "$LAST_BUILT" ]; then
+            echo "Last upstream revision dispatched: $LAST_BUILT"
+            echo "last_built=$LAST_BUILT" >> "$GITHUB_OUTPUT"
+          else
+            echo "No valid previous upstream-build marker exists yet."
+            echo "last_built=none" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$LAST_BUILT" = "$UPSTREAM_HEAD" ]; then
+            REVISION_NEW=false
+            echo "This exact upstream revision was already dispatched previously."
+          else
+            REVISION_NEW=true
+            echo "New upstream revision detected for iOS build tracking."
+          fi
+          echo "revision_new=$REVISION_NEW" >> "$GITHUB_OUTPUT"
+
+          # -----------------------------------------------------------------
+          # Mirror every NON-WORKFLOW upstream source change while preserving
+          # the fork-owned revision marker.
+          # -----------------------------------------------------------------
+          if git diff --quiet HEAD upstream/master -- \
+              . \
+              ':(exclude).github/workflows/**' \
+              ':(exclude).armsx2-ios16-last-built-upstream'
+          then
+            echo "Fork source already matches upstream/master."
+            echo "source_changed=false" >> "$GITHUB_OUTPUT"
             echo "local_after=$LOCAL_BEFORE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "Upstream source changes detected."
-          echo "Files which will change in the fork (workflow files excluded):"
-          git diff --name-status HEAD upstream/master -- . ':(exclude).github/workflows/**' || true
+          echo "Files which will change in the fork (workflow + marker excluded):"
+          git diff --name-status HEAD upstream/master -- \
+            . \
+            ':(exclude).github/workflows/**' \
+            ':(exclude).armsx2-ios16-last-built-upstream' || true
 
-          # Mirror the upstream snapshot WITHOUT importing upstream commit
-          # history.  This is important: if we merged/cherry-picked upstream
-          # commits which touched .github/workflows, GitHub would reject the
-          # push even if a later commit restored our workflow files.
-          #
-          # git restore also handles upstream additions and deletions.
+          # Snapshot-mirror upstream source WITHOUT importing upstream commit
+          # history. This is what keeps upstream workflow commits out of the
+          # push while still handling additions, modifications and deletions.
           git restore \
             --source=upstream/master \
             --staged \
             --worktree \
-            -- . ':(exclude).github/workflows/**'
+            -- \
+            . \
+            ':(exclude).github/workflows/**' \
+            ':(exclude).armsx2-ios16-last-built-upstream'
 
-          # Guardrails: our two fork-owned workflows must still exist and must
-          # not be staged for modification by this source sync.
+          # Guardrails.
           for required in \
             .github/workflows/build-ios16.yml \
             .github/workflows/sync-upstream-ios16.yml
@@ -120,9 +163,14 @@ jobs:
             exit 1
           fi
 
+          if git diff --cached --name-only | grep -q '^\.armsx2-ios16-last-built-upstream$'; then
+            echo "ERROR: source sync unexpectedly staged the V4 revision marker." >&2
+            exit 1
+          fi
+
           if git diff --cached --quiet; then
             echo "No non-workflow changes remained after snapshot sync."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "source_changed=false" >> "$GITHUB_OUTPUT"
             echo "local_after=$LOCAL_BEFORE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -131,33 +179,88 @@ jobs:
 
           LOCAL_AFTER="$(git rev-parse HEAD)"
           echo "local_after=$LOCAL_AFTER" >> "$GITHUB_OUTPUT"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "source_changed=true" >> "$GITHUB_OUTPUT"
 
           echo "Created workflow-safe source sync commit: $LOCAL_AFTER"
-          echo "Pushing fork-owned source snapshot (no .github/workflows changes)..."
+          echo "Pushing fork source snapshot..."
           git push origin HEAD:master
 
-      - name: Dispatch the iOS 16 compatibility build
-        if: steps.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_build)
+      - name: Dispatch latest iOS 16 build
+        id: dispatch
+        if: >
+          steps.sync.outputs.revision_new == 'true' ||
+          steps.sync.outputs.source_changed == 'true' ||
+          (github.event_name == 'workflow_dispatch' && inputs.force_build)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Dispatching .github/workflows/build-ios16.yml in fork: $GITHUB_REPOSITORY"
-          gh workflow run build-ios16.yml --repo "$GITHUB_REPOSITORY" --ref master
 
-          echo "### ARMSX2 workflow-safe upstream sync" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Previous fork head: \`${{ steps.sync.outputs.local_before }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Upstream head: \`${{ steps.sync.outputs.upstream_head }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Synced fork head: \`${{ steps.sync.outputs.local_after }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Upstream `.github/workflows/`: **intentionally preserved from fork**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- iOS 16 compatibility build: **dispatched**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Dispatching fork workflow:"
+          echo "  repo:     $GITHUB_REPOSITORY"
+          echo "  workflow: build-ios16.yml"
+          echo "  ref:      master"
+          echo "  upstream: ${{ steps.sync.outputs.upstream_head }}"
 
-      - name: Summary when already current and no build requested
-        if: steps.sync.outputs.changed == 'false' && !(github.event_name == 'workflow_dispatch' && inputs.force_build)
+          gh workflow run build-ios16.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master
+
+          echo "dispatch_succeeded=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record upstream revision after successful dispatch
+        if: steps.dispatch.outputs.dispatch_succeeded == 'true'
         shell: bash
         run: |
-          echo "### ARMSX2 workflow-safe upstream sync" >> "$GITHUB_STEP_SUMMARY"
-          echo "Fork source already matches upstream/master (upstream workflow differences are intentionally ignored)." >> "$GITHUB_STEP_SUMMARY"
-          echo "No macOS iOS build was started." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+
+          MARKER_FILE=".armsx2-ios16-last-built-upstream"
+          UPSTREAM_HEAD="${{ steps.sync.outputs.upstream_head }}"
+
+          printf '%s\n' "$UPSTREAM_HEAD" > "$MARKER_FILE"
+          git add "$MARKER_FILE"
+
+          if git diff --cached --quiet; then
+            echo "Revision marker already records $UPSTREAM_HEAD."
+          else
+            git commit -m "Record iOS 16 build dispatch ${UPSTREAM_HEAD:0:12}"
+            git push origin HEAD:master
+            echo "Recorded upstream build revision: $UPSTREAM_HEAD"
+          fi
+
+      - name: Summary when build dispatched
+        if: steps.dispatch.outputs.dispatch_succeeded == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### ARMSX2 V4 revision-tracked upstream sync"
+            echo ""
+            echo "- Previous built upstream revision: \`${{ steps.sync.outputs.last_built }}\`"
+            echo "- Current upstream revision: \`${{ steps.sync.outputs.upstream_head }}\`"
+            echo "- New upstream revision: **${{ steps.sync.outputs.revision_new }}**"
+            echo "- Fork source changed during sync: **${{ steps.sync.outputs.source_changed }}**"
+            echo "- Upstream \`.github/workflows/\`: **intentionally preserved from fork**"
+            echo "- \`build-ios16.yml\`: **automatically dispatched ✅**"
+            echo "- V4 revision marker: **updated after successful dispatch ✅**"
+            echo ""
+            echo "GitHub may label the resulting build as 'Manually run by github-actions[bot]'."
+            echo "That still means this sync workflow launched it automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary when latest revision is already built
+        if: >
+          steps.dispatch.outcome == 'skipped' &&
+          steps.sync.outputs.revision_new == 'false' &&
+          steps.sync.outputs.source_changed == 'false'
+        shell: bash
+        run: |
+          {
+            echo "### ARMSX2 V4 revision-tracked upstream sync"
+            echo ""
+            echo "- Current upstream revision: \`${{ steps.sync.outputs.upstream_head }}\`"
+            echo "- Last built upstream revision: \`${{ steps.sync.outputs.last_built }}\`"
+            echo "- Fork source: **already current**"
+            echo "- iOS build: **already refreshed for this exact upstream revision — skipped ✅**"
+            echo "- Next new upstream/master revision will automatically dispatch \`build-ios16.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
