@@ -776,6 +776,11 @@ void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 
 	if (feedback_write_1) // FIXME I'm not sure dRect[0] is always correct
 		StretchRect(dTex, full_r, sTex[2], dRect[0], ShaderConvert::YUV, filter);
+
+	// With both circuits off nothing was drawn, so the clear above is the whole frame and it is
+	// still only deferred. Everyone downstream binds the native texture, and none of them can
+	// commit a clear, so do it here while a pass can still be opened.
+	FlushClears(dTex);
 }}
 
 void GSDeviceMTL::DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb)
@@ -2134,6 +2139,9 @@ void GSDeviceMTL::PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture
 	else
 	{
 		// !dTex → Use current draw encoder
+		// This pass is already open, so a clear still pending on the source can no longer be
+		// committed here. Whoever produced sTex owes us the flush.
+		pxAssertMsg(sTex->GetState() != GSTexture::State::Cleared, "Presented texture still has a pending clear");
 		[m_current_render.encoder setRenderPipelineState:pipe];
 		[m_current_render.encoder setFragmentSamplerState:m_sampler_hw[filter == Biln ? SamplerSelector::Linear().key : SamplerSelector::Point().key] atIndex:0];
 		[m_current_render.encoder setFragmentTexture:static_cast<GSTextureMTL*>(sTex)->GetTexture() atIndex:0];
