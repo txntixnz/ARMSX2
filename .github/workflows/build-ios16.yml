@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.3.1 analog tuning UI hotfix)
+name: Build ARMSX2 for iOS 16 (compat v9.4 low memory mode)
 
 on:
   workflow_dispatch:
@@ -1643,6 +1643,264 @@ jobs:
           print('V9.3.1 verification passed.')
           PY
 
+      - name: Add iPhone Low Memory Mode V9.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          swift_path = Path('platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift')
+          scene_path = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
+          renderer_path = Path('pcsx2/GS/Renderers/HW/GSRendererHW.cpp')
+
+          for path in (swift_path, scene_path, renderer_path):
+              if not path.is_file():
+                  raise SystemExit(
+                      f'Low Memory V9.4: expected source file missing: {path}'
+                  )
+
+          # ==============================================================
+          # SwiftUI toggle. This intentionally lives on the already-patched
+          # Game Controller page so the iOS 16 build does not depend on an
+          # upstream settings-navigation layout which may change frequently.
+          # ==============================================================
+          swift_tag = '// ARMSX2_IOS16_LOW_MEMORY_MODE_V94'
+          swift = swift_path.read_text()
+
+          if swift_tag not in swift:
+              struct_anchor = 'struct GamepadSettingsView: View {'
+              if struct_anchor not in swift:
+                  raise SystemExit(
+                      'Low Memory V9.4: GamepadSettingsView declaration changed upstream.'
+                  )
+
+              helper = '''// ARMSX2_IOS16_LOW_MEMORY_MODE_V94
+          private func armsx2SetLowMemoryEnvironment(_ enabled: Bool) {
+              let value = enabled ? "1" : "0"
+              "ARMSX2_LOW_MEMORY_MODE".withCString { key in
+                  value.withCString { rawValue in
+                      _ = setenv(key, rawValue, 1)
+                  }
+              }
+          }
+
+          '''
+              swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
+
+              # Anchor on the field-proven V9.3.1 tuning property so the RAM
+              # feature can never silently replace the controller changes.
+              storage_anchor = (
+                  '    @AppStorage("ARMSX2_GT4TriggerFullThreshold") '
+                  'private var gt4TriggerFullThreshold = 1.0\n'
+              )
+              if storage_anchor not in swift:
+                  raise SystemExit(
+                      'Low Memory V9.4: V9.3.1 GT4 tuning storage anchor is missing.'
+                  )
+
+              swift = swift.replace(
+                  storage_anchor,
+                  storage_anchor +
+                  '    @AppStorage("ARMSX2_LowMemoryMode") '
+                  'private var lowMemoryMode = true\n',
+                  1,
+              )
+
+              # Put the switch immediately before the existing controller Tools
+              # section. This avoids adding any new NavigationLink/destination
+              # (important for our iOS 16 SwiftUI compatibility branch).
+              rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
+              if rumble_pos < 0:
+                  raise SystemExit(
+                      'Low Memory V9.4: Game Controller Tools section changed upstream.'
+                  )
+              tools_section_pos = swift.rfind('Section {', 0, rumble_pos)
+              if tools_section_pos < 0:
+                  raise SystemExit(
+                      'Low Memory V9.4: could not locate Tools section.'
+                  )
+
+              memory_section = '''Section {
+                      Toggle(isOn: Binding(
+                          get: { lowMemoryMode },
+                          set: { enabled in
+                              lowMemoryMode = enabled
+                              armsx2SetLowMemoryEnvironment(enabled)
+                          }
+                      )) {
+                          Label {
+                              VStack(alignment: .leading, spacing: 3) {
+                                  Text("Low Memory Mode")
+                                  Text("Recommended for 6 GB iPhones")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                          } icon: {
+                              Image(systemName: "memorychip")
+                          }
+                      }
+                  } header: {
+                      Text("iPhone Memory")
+                  } footer: {
+                      Text("Keeps image quality unchanged. When enabled, ARMSX2 purges the GS texture hash cache at about 384 MB instead of waiting for about 1 GB, and releases the renderer's pooled textures at the same time. This can trade a little extra texture re-upload work for much lower peak RAM use.")
+                  }
+
+                  '''
+              swift = (
+                  swift[:tools_section_pos] +
+                  memory_section +
+                  swift[tools_section_pos:]
+              )
+              swift_path.write_text(swift)
+
+          # ==============================================================
+          # Cold-launch persistence. The setting defaults ON for this custom
+          # iPhone build, but remains user-switchable at runtime.
+          # ==============================================================
+          scene_tag = '// ARMSX2_IOS16_LOW_MEMORY_BOOT_V94'
+          scene = scene_path.read_text()
+
+          if scene_tag not in scene:
+              init_anchor = '// --- SDL Initialization ---'
+              init_pos = scene.find(init_anchor)
+              if init_pos < 0:
+                  raise SystemExit(
+                      'Low Memory V9.4: SceneDelegate SDL initialization marker changed upstream.'
+                  )
+
+              boot = '''// ARMSX2_IOS16_LOW_MEMORY_BOOT_V94
+          NSUserDefaults *armsx2MemoryDefaults = [NSUserDefaults standardUserDefaults];
+          const BOOL armsx2LowMemoryEnabled =
+              [armsx2MemoryDefaults objectForKey:@"ARMSX2_LowMemoryMode"] ?
+                  [armsx2MemoryDefaults boolForKey:@"ARMSX2_LowMemoryMode"] : YES;
+          setenv("ARMSX2_LOW_MEMORY_MODE", armsx2LowMemoryEnabled ? "1" : "0", 1);
+          NSLog(@"[Memory] Low Memory Mode: %@ (GS hash cache limit: %@)",
+                armsx2LowMemoryEnabled ? @"ON" : @"OFF",
+                armsx2LowMemoryEnabled ? @"384 MB" : @"1 GB stock");
+
+          '''
+              scene = scene[:init_pos] + boot + scene[init_pos:]
+              scene_path.write_text(scene)
+
+          # ==============================================================
+          # Native renderer: reuse PCSX2's existing, proven hash-cache
+          # overflow cleanup. We only make its threshold conditional.
+          #
+          # Stock behavior is preserved exactly when the toggle is OFF:
+          #     1024 MB -> RemoveAll(sources+hash) -> PurgePool -> Partial
+          # Low Memory Mode changes only the trigger point to 384 MB.
+          # ==============================================================
+          native_tag = '// ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94'
+          renderer = renderer_path.read_text()
+
+          if native_tag not in renderer:
+              if '#include <cstdlib>' not in renderer:
+                  include_anchor = '#include <bit>'
+                  if include_anchor not in renderer:
+                      raise SystemExit(
+                          'Low Memory V9.4: GSRendererHW standard include anchor changed upstream.'
+                      )
+                  renderer = renderer.replace(
+                      include_anchor,
+                      include_anchor + '\n#include <cstdlib>',
+                      1,
+                  )
+
+              condition = (
+                  'if (g_texture_cache->GetHashCacheMemoryUsage() > '
+                  '1024 * 1024 * 1024)'
+              )
+              if condition not in renderer:
+                  raise SystemExit(
+                      'Low Memory V9.4: stock 1 GB hash-cache overflow condition '
+                      'changed upstream; refusing a blind renderer patch.'
+                  )
+
+              replacement = '''// ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94
+          const char* armsx2_low_memory_env = std::getenv("ARMSX2_LOW_MEMORY_MODE");
+          const bool armsx2_low_memory_mode =
+              armsx2_low_memory_env && armsx2_low_memory_env[0] == '1';
+          const u64 armsx2_hash_cache_limit = armsx2_low_memory_mode ?
+              (384ULL * 1024ULL * 1024ULL) :
+              (1024ULL * 1024ULL * 1024ULL);
+
+          if (g_texture_cache->GetHashCacheMemoryUsage() > armsx2_hash_cache_limit)'''
+
+              renderer = renderer.replace(condition, replacement, 1)
+              renderer_path.write_text(renderer)
+
+          print('Low Memory Mode V9.4 patched successfully.')
+          print(f'  Runtime toggle: {swift_path}')
+          print(f'  Cold-launch persistence: {scene_path}')
+          print(f'  GS hash-cache limit: {renderer_path}')
+          PY
+
+      - name: Verify iPhone Low Memory Mode V9.4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo 'Low Memory Mode UI:'
+          grep -n -A70 -B8 'ARMSX2_IOS16_LOW_MEMORY_MODE_V94' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          echo
+
+          echo 'Low Memory Mode renderer path:'
+          grep -n -A35 -B8 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          echo
+
+          grep -q 'ARMSX2_LowMemoryMode' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q 'ARMSX2_LOW_MEMORY_MODE' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q '384ULL \* 1024ULL \* 1024ULL' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q '1024ULL \* 1024ULL \* 1024ULL' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'g_texture_cache->RemoveAll(true, false, true);' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'g_gs_device->PurgePool();' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'GSConfig.TexturePreloading = TexturePreloadingLevel::Partial;' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+
+          # Make sure V9.4 did not disturb the already validated controller branch.
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_INLINE_V931' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          renderer = Path('pcsx2/GS/Renderers/HW/GSRendererHW.cpp').read_text()
+          if 'GetHashCacheMemoryUsage() > 1024 * 1024 * 1024' in renderer:
+              raise SystemExit('Low Memory V9.4: old unconditional 1 GB condition remains.')
+
+          if renderer.count('ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94') != 1:
+              raise SystemExit('Low Memory V9.4: native marker count is not exactly one.')
+
+          swift = Path(
+              'platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift'
+          ).read_text()
+          start = swift.find('ARMSX2_IOS16_LOW_MEMORY_MODE_V94')
+          if start < 0:
+              raise SystemExit('Low Memory V9.4: Swift marker missing during verification.')
+          if 'NavigationLink' in swift[start:start + 2500]:
+              raise SystemExit('Low Memory V9.4: memory control unexpectedly introduced NavigationLink.')
+
+          print('384 MB Low Memory threshold: OK')
+          print('1 GB stock fallback when disabled: OK')
+          print('Existing PCSX2 purge path preserved: OK')
+          print('GT4 V9.2 + analog tuning V9.3.1 markers preserved: OK')
+          print('V9.4 verification passed.')
+          PY
+
       - name: Show remaining iOS 17 source markers
         shell: bash
         run: |
@@ -1678,7 +1936,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.3.1
+          name: ARMSX2-iOS16-unsigned-v9.4-low-memory
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -1686,12 +1944,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.3.1
+          name: ARMSX2-iOS16-build-log-v9.4-low-memory
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.3.1 analog-tuning UI-hotfix build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.3.1 and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.4 low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.4-low-memory and inspect the first real error.' >&2
           exit 1
