@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.4 low memory mode)
+name: Build ARMSX2 for iOS 16 (compat v9.4.1 low memory verifier fix)
 
 on:
   workflow_dispatch:
@@ -1888,17 +1888,34 @@ jobs:
           swift = Path(
               'platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift'
           ).read_text()
-          start = swift.find('ARMSX2_IOS16_LOW_MEMORY_MODE_V94')
-          if start < 0:
-              raise SystemExit('Low Memory V9.4: Swift marker missing during verification.')
-          if 'NavigationLink' in swift[start:start + 2500]:
-              raise SystemExit('Low Memory V9.4: memory control unexpectedly introduced NavigationLink.')
+          if 'ARMSX2_IOS16_LOW_MEMORY_MODE_V94' not in swift:
+              raise SystemExit('Low Memory V9.4.1: Swift marker missing during verification.')
+
+          # V9.4 verifier bug fix: do not scan an arbitrary character window for
+          # NavigationLink. GamepadSettingsView already contains unrelated stock
+          # NavigationLinks, so that produced a false failure even though the
+          # Low Memory control itself is a Toggle. Verify the exact control shape
+          # instead.
+          required_ui = [
+              '@AppStorage("ARMSX2_LowMemoryMode")',
+              'private var lowMemoryMode = true',
+              'Toggle(isOn: Binding(',
+              'Text("Low Memory Mode")',
+              'Text("iPhone Memory")',
+              'armsx2SetLowMemoryEnvironment(enabled)',
+          ]
+          missing_ui = [needle for needle in required_ui if needle not in swift]
+          if missing_ui:
+              raise SystemExit(
+                  'Low Memory V9.4.1: expected Toggle UI wiring missing: ' +
+                  ', '.join(missing_ui)
+              )
 
           print('384 MB Low Memory threshold: OK')
           print('1 GB stock fallback when disabled: OK')
           print('Existing PCSX2 purge path preserved: OK')
           print('GT4 V9.2 + analog tuning V9.3.1 markers preserved: OK')
-          print('V9.4 verification passed.')
+          print('V9.4.1 verification passed.')
           PY
 
       - name: Show remaining iOS 17 source markers
@@ -1936,7 +1953,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.4-low-memory
+          name: ARMSX2-iOS16-unsigned-v9.4.1-low-memory
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -1944,12 +1961,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.4-low-memory
+          name: ARMSX2-iOS16-build-log-v9.4.1-low-memory
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.4 low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.4-low-memory and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.4.1 low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.4.1-low-memory and inspect the first real error.' >&2
           exit 1
