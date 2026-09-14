@@ -42,12 +42,25 @@ class AirPlayTests(unittest.TestCase):
         self.assertIn('settings.localized("Please select a game")', metal_view)
 
         self.assertIn("isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive", app_delegate)
-        self.assertIn('external ? @"External Display" : @"Default Configuration"', app_delegate)
+        self.assertIn('configurationWithName:(external ? @"External Display" : @"Default Configuration")', app_delegate)
         self.assertIn("sessionRole:connectingSceneSession.role", app_delegate)
 
         self.assertIn(
             "self.window = [[[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene] autorelease];",
             scene_delegate.split("@implementation ARMSX2ExternalDisplaySceneDelegate", 1)[1],
+        )
+
+    def test_scene_lookups_never_land_on_the_tv(self):
+        swift = IOS / "swift"
+        walkers = [
+            path.relative_to(swift).as_posix()
+            for path in sorted(swift.rglob("*.swift"))
+            if "connectedScenes" in path.read_text()
+        ]
+        self.assertEqual(walkers, ["Models/SwiftUIHost.swift"])
+        self.assertIn(
+            "connectedScenes.first { $0.session.role == .windowApplication }",
+            (swift / "Models/SwiftUIHost.swift").read_text(),
         )
 
 

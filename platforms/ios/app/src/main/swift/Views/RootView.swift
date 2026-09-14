@@ -152,15 +152,29 @@ struct RootView: View {
             GameLibraryRuntimeResources.releaseForGameplay()
             PatchStore.shared.releasePresentationResources()
         }
-        .onOpenURL { url in
-            if !ARMSX2DeepLinkHandler.handle(url) {
-                fileImporter.handleURL(url)
-            }
-        }
         .alert(settings.localized("File Import"), isPresented: $fileImporter.showImportAlert) {
             Button(settings.localized("OK")) {}
         } message: {
             Text(fileImporter.lastImportMessage ?? "")
+        }
+        .alert(
+            settings.localized("Restart VM?"),
+            isPresented: Binding(
+                get: { appState.pendingRestartGame != nil },
+                set: { if !$0 { appState.pendingRestartGame = nil } }
+            )
+        ) {
+            Button(settings.localized("Cancel"), role: .cancel) {
+                appState.pendingRestartGame = nil
+            }
+            Button(settings.localized("Restart"), role: .destructive) {
+                if let game = appState.pendingRestartGame {
+                    appState.shutdownAndBoot(isoName: game)
+                }
+                appState.pendingRestartGame = nil
+            }
+        } message: {
+            Text("\(settings.localized("VM is currently running."))\n\(settings.localized("Shut down and start")) \(((appState.pendingRestartGame ?? "") as NSString).lastPathComponent)?")
         }
         .alert(
             settings.localized("BIOS"),
@@ -1471,13 +1485,8 @@ private enum KeyWindowSafeArea {
 
     @MainActor
     private static func keyWindowInsets() -> UIEdgeInsets {
-        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            guard scene.activationState == .foregroundActive || scene.activationState == .foregroundInactive else { continue }
-            if let window = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first {
-                return window.safeAreaInsets
-            }
-        }
-        return .zero
+        let windows = UIApplication.shared.appWindowScene?.windows ?? []
+        return (windows.first(where: { $0.isKeyWindow }) ?? windows.first)?.safeAreaInsets ?? .zero
     }
 }
 
