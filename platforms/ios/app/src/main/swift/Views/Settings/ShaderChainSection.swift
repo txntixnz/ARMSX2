@@ -20,6 +20,7 @@ struct ShaderChainSection: View {
     @StateObject private var importer = ShaderPackImporter()
     @StateObject private var params = ShaderParams()
     @State private var pickerSource: ShaderPackPickerSource?
+    @State private var browseRequest: ShaderPresetBrowserRequest?
     @State private var saveRequest: ShaderPresetSaveRequest?
 
     private var settings: SettingsStore { SettingsStore.shared }
@@ -35,90 +36,96 @@ struct ShaderChainSection: View {
 
     private var chainSection: some View {
         Section {
-            Toggle(localized("Shader Chain"), isOn: $enabled)
-                .sheet(item: $pickerSource) { source in
-                    picker(for: source)
+            Button {
+                browseRequest = ShaderPresetBrowserRequest()
+            } label: {
+                HStack {
+                    Text(localized("Preset"))
+                    Spacer()
+                    Text(presetName)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.tertiary)
                 }
-                .task(id: presetRef) {
-                    await params.load(token: presetRef)
-                }
-
-            if enabled {
-                NavigationLink {
+            }
+            .tint(.primary)
+            .sheet(item: $browseRequest, onDismiss: {
+                if !presetRef.isEmpty, ShaderPresetLibrary.resolve(presetRef) == nil { presetRef = "" }
+            }) { _ in
+                NavigationStack {
                     ShaderPresetBrowserView(
                         title: localized("Shader Presets"),
                         folder: nil,
                         selectedToken: presetRef,
                         localized: localized,
-                        onSelect: { presetRef = $0 }
+                        onSelect: { token in
+                            select(token)
+                            browseRequest = nil
+                        }
                     )
-                } label: {
-                    HStack {
-                        Text(localized("Preset"))
-                        Spacer()
-                        Text(presetName)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
                 }
             }
+            .task(id: presetRef) {
+                await params.load(token: presetRef)
+            }
 
-            // Outside the gate on purpose: with the chain off there is nothing to pick yet,
-            // and a first run would otherwise have to guess that the toggle comes first.
+            if !presetRef.isEmpty {
+                Toggle(localized("Shaders"), isOn: $enabled)
+            }
+
             NavigationLink {
-                ShaderCatalogBrowserView(localized: localized)
+                ShaderCatalogBrowserView(localized: localized, onSelect: select)
             } label: {
                 Label(localized("Download Shaders"), systemImage: "arrow.down.circle")
             }
 
-            if enabled {
-                Menu {
-                    Button {
-                        pickerSource = ShaderPackPickerSource(isFolder: false)
-                    } label: {
-                        Label(localized("From a Zip Archive"), systemImage: "doc.zipper")
-                    }
-                    Button {
-                        pickerSource = ShaderPackPickerSource(isFolder: true)
-                    } label: {
-                        Label(localized("From a Folder"), systemImage: "folder")
-                    }
+            Menu {
+                Button {
+                    pickerSource = ShaderPackPickerSource(isFolder: false)
                 } label: {
-                    Label(localized("Install Shader Pack"), systemImage: "square.and.arrow.down")
+                    Label(localized("From a Zip Archive"), systemImage: "doc.zipper")
                 }
-                .disabled(importer.isBusy)
-
-                if importer.isBusy {
-                    ProgressView(localized("Installing..."))
+                Button {
+                    pickerSource = ShaderPackPickerSource(isFolder: true)
+                } label: {
+                    Label(localized("From a Folder"), systemImage: "folder")
                 }
+            } label: {
+                Label(localized("Install Shader Pack"), systemImage: "square.and.arrow.down")
+            }
+            .disabled(importer.isBusy)
+            .sheet(item: $pickerSource) { source in
+                picker(for: source)
+            }
 
-                if let installed = importer.installedName {
-                    Text(localized("Installed") + " " + installed)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            if importer.isBusy {
+                ProgressView(localized("Installing..."))
+            }
 
-                ForEach(importer.errors.sorted { $0.key < $1.key }, id: \.key) { entry in
-                    Text(entry.value)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
+            if let installed = importer.installedName {
+                Text(String(format: localized("Installed %@. Pick a preset from it under Preset."), installed))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-                if !presetRef.isEmpty {
-                    Button(role: .destructive) {
-                        presetRef = ""
-                    } label: {
-                        Text(localized("Clear Preset"))
-                    }
+            ForEach(importer.errors.sorted { $0.key < $1.key }, id: \.key) { entry in
+                Text(localized(entry.value))
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            if !presetRef.isEmpty {
+                Button(role: .destructive) {
+                    presetRef = ""
+                } label: {
+                    Text(localized("Clear Preset"))
                 }
             }
-        } header: {
-            Text(localized("Shader Chain"))
         } footer: {
-            Text(localized("RetroArch .slangp presets, applied to the finished image after the other post-processing steps. A preset compiles the first time you select it, so that one frame can hitch.")
-                + "\n\n"
-                + localized("Presets from the RetroArch collection, one at a time. Each download is checked against the catalogue's own hash before anything is written, and lands beside a pack you installed by hand."))
+            Text(localized("Filters like CRT scanlines or LCD grids, drawn over the game. The first frame can stutter while one loads."))
         }
     }
 
@@ -144,7 +151,7 @@ struct ShaderChainSection: View {
                 // change and the name field would lose the keyboard on each keystroke.
                 .sheet(item: $saveRequest) { request in
                     ShaderPresetSaveSheet(request: request, localized: localized) { name in
-                        Task { await params.save(as: name) }
+                        Task { if let token = await params.save(as: name) { select(token) } }
                     }
                 }
             }
@@ -157,60 +164,51 @@ struct ShaderChainSection: View {
                 }
             }
 
-            if let saved = params.savedName {
-                Text(localized("Saved") + " " + saved)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             if let failure = params.errorText {
-                Text(failure)
+                Text(localized(failure))
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
         } header: {
             Text(localized("Parameters"))
         } footer: {
-            Text(localized("What this preset's author chose to expose, in the order they declared it. A saved preset lands in My Presets and is selectable from the browser; it points at the base pack by path, so removing that pack breaks it, and Reset on a saved preset returns to the values you saved."))
+            Text(localized("Changes show right away. Save as New Preset keeps them in My Presets. A saved preset stops working if you delete the shader it came from."))
         }
     }
 
     @ViewBuilder
     private func parameterRow(_ param: ShaderParam) -> some View {
         if param.isAdjustable {
-            VStack(alignment: .leading, spacing: 4) {
-                // setValue is the clamp that reaches the store: NaN lands on the author's initial.
-                NumberRow(
-                    param.name,
-                    value: Binding(
-                        get: { params.value(for: param) },
-                        set: { params.setValue($0, for: param) }
-                    ),
-                    in: param.minimum...param.maximum,
-                    format: NumberFormat.plain.decimals(param.decimals),
-                    step: Double(param.increment),
-                    detents: NumberRow.stops(in: Double(param.minimum)...Double(param.maximum),
-                                             step: Double(param.increment)),
-                    accessory: NumberRowAccessory(
-                        systemImage: "arrow.counterclockwise",
-                        label: "Reset %@",
-                        isVisible: params.overrides[param.name] != nil,
-                        action: { params.reset(param) }
-                    ),
-                    settings: settings
-                )
-
-                if !param.description.isEmpty, param.description != param.name {
-                    Text(param.description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            // setValue is the clamp that reaches the store: NaN lands on the author's initial.
+            NumberRow(
+                param.label,
+                value: Binding(
+                    get: { params.value(for: param) },
+                    set: { params.setValue($0, for: param) }
+                ),
+                in: param.minimum...param.maximum,
+                format: NumberFormat.plain.decimals(param.decimals),
+                step: Double(param.increment),
+                detents: NumberRow.stops(in: Double(param.minimum)...Double(param.maximum),
+                                         step: Double(param.increment)),
+                accessory: NumberRowAccessory(
+                    systemImage: "arrow.counterclockwise",
+                    label: "Reset %@",
+                    isVisible: params.overrides[param.name] != nil,
+                    action: { params.reset(param) }
+                ),
+                settings: settings
+            )
         } else {
-            Text(param.name)
+            Text(param.label)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private func select(_ token: String) {
+        enabled = true
+        presetRef = token
     }
 
     private var presetName: String {

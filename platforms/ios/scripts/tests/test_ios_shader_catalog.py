@@ -182,6 +182,39 @@ class BrowserReachability(unittest.TestCase):
             "the in-game panel mounts the shared section outside a NavigationStack, so every "
             "NavigationLink in it -- Preset and Download Shaders both -- is dead on tap")
 
+    def test_a_downloaded_preset_can_be_picked_from_its_row(self):
+        """Use on a downloaded row picks its preset instead of stopping at Installed."""
+        section = source(self.SECTION)
+        browser = source(BROWSER)
+        self.assertRegex(section, r"ShaderCatalogBrowserView\([^)]*onSelect:",
+                         "the section opens the download list without onSelect, so Use selects "
+                         "nothing")
+        self.assertRegex(section, r"enabled = true\s+presetRef = token",
+                         "select sets the preset before switching shaders on. If the store drops "
+                         "that token as unresolvable, shaders are left on with no preset")
+        self.assertLess(at(browser, "installer.presetToken(for: entry)", "the Use row"),
+                        at(browser, "onSelect(token)", "the Use action"),
+                        "the Use action runs before the row has found the installed preset")
+        self.assertIn('firstIndex(of: "/")', source(INSTALLER),
+                      "presetToken only looks for <pack>/<id>.slangp, but the extractor drops a "
+                      "top folder every file shares, so crt/crt-geom lands at "
+                      "<pack>/crt-geom.slangp")
+
+    def test_a_preset_picked_in_any_folder_closes_the_browser(self):
+        """A dismiss taken from an outer folder is ignored once an inner folder is pushed on top."""
+        self.assertRegex(
+            source(self.SECTION), r"select\(token\)\s+browseRequest = nil",
+            "the Shaders section no longer closes the preset sheet on a pick, so picking inside a "
+            "folder leaves the browser open")
+        self.assertRegex(
+            source(SWIFT / "Views/PerGameSettingsPanel.swift"),
+            r"perGameShaderPresetRef = token\s+shaderPresetRequest = nil",
+            "the per-game panel no longer closes its preset sheet on a pick")
+        self.assertNotIn(
+            "dismiss()", source(SWIFT / "Views/Settings/ShaderPresetBrowserView.swift"),
+            "the preset browser dismisses itself again; from an inner folder that does nothing, "
+            "so the host has to close the sheet")
+
 
 if __name__ == "__main__":
     unittest.main()

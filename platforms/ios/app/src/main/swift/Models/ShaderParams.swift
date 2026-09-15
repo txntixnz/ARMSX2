@@ -5,17 +5,20 @@ import Foundation
 
 enum ShaderParamsError: LocalizedError {
     case noName
+    case missingBase
     case noSavedRoot
     case wouldOverwriteBase
 
     var errorDescription: String? {
         switch self {
         case .noName:
-            return "That name has nothing in it that can become a filename."
+            return "Use letters or numbers in the name."
+        case .missingBase:
+            return "The preset these values came from is gone, so nothing was saved."
         case .noSavedRoot:
-            return "The Documents shader folder could not be opened."
+            return "Your shader folder couldn't be opened."
         case .wouldOverwriteBase:
-            return "That is the preset this one is built from. Give it a different name."
+            return "That name belongs to the preset you're changing. Pick another name."
         }
     }
 }
@@ -31,6 +34,7 @@ struct ShaderParam: Identifiable, Hashable, Sendable {
     let step: Float
 
     var id: String { name }
+    var label: String { description.isEmpty ? name : description }
 
     /// Whether the author left any room to move, and the only thing inferred about a
     /// parameter's role. Do not "improve" this by reading the name or the description: stock
@@ -93,7 +97,6 @@ final class ShaderParams: ObservableObject {
     @Published private(set) var params: [ShaderParam] = []
     @Published private(set) var overrides: [String: Float] = [:]
     @Published private(set) var isLoading = false
-    @Published private(set) var savedName: String?
     @Published private(set) var errorText: String?
 
     nonisolated static let section = "EmuCore/GS"
@@ -106,7 +109,6 @@ final class ShaderParams: ObservableObject {
 
     func load(token newToken: String) async {
         token = newToken
-        savedName = nil
         errorText = nil
         guard let url = ShaderPresetLibrary.resolve(newToken) else {
             params = []
@@ -143,22 +145,29 @@ final class ShaderParams: ObservableObject {
         pushEffective()
     }
 
-    func save(as name: String) async {
-        savedName = nil
+    func save(as name: String) async -> String? {
         errorText = nil
         let safe = Self.safeName(name)
-        guard !safe.isEmpty, let base = ShaderPresetLibrary.resolve(token) else {
+        guard !safe.isEmpty else {
             errorText = ShaderParamsError.noName.errorDescription
-            return
+            return nil
+        }
+        guard let base = ShaderPresetLibrary.resolve(token) else {
+            errorText = ShaderParamsError.missingBase.errorDescription
+            return nil
         }
         let text = Self.presetText(base: base, params: params, overrides: overrides)
         do {
             let url = try await Task.detached(priority: .userInitiated) {
                 try Self.write(text, named: safe, base: base)
             }.value
-            savedName = url.deletingPathExtension().lastPathComponent
+            guard let saved = ShaderPresetLibrary.token(for: url) else { return nil }
+            var store = Self.stored()
+            if store.removeValue(forKey: saved) != nil { Self.storeOverrides(store) }
+            return saved
         } catch {
             errorText = error.localizedDescription
+            return nil
         }
     }
 
@@ -194,9 +203,13 @@ final class ShaderParams: ObservableObject {
         guard !token.isEmpty else { return }
         var store = Self.stored()
         store[token] = overrides.isEmpty ? nil : overrides
+        Self.storeOverrides(store)
+    }
+
+    private static func storeOverrides(_ store: [String: [String: Float]]) {
         guard let data = try? JSONEncoder().encode(store),
               let json = String(data: data, encoding: .utf8) else { return }
-        ARMSX2Bridge.setINIString(Self.section, key: Self.key, value: json)
+        ARMSX2Bridge.setINIString(section, key: key, value: json)
     }
 
     private nonisolated static func stored() -> [String: [String: Float]] {
@@ -233,7 +246,7 @@ final class ShaderParams: ObservableObject {
     }
 
     /// Relative while the base sits in the same Documents root, so the pair survives the
-    /// container UUID moving. A bundled base gets a path instead, which a reinstall breaks.
+    /// container UUID moving. A bundled base gets a path, which launch re-roots after a reinstall.
     private static func reference(to base: URL) -> String {
         let target = base.standardizedFileURL
         guard let root = ShaderPresetLibrary.userRoot?.standardizedFileURL,

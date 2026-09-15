@@ -6,13 +6,6 @@ import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
 
-/// A constant id on purpose. The panel's body re-runs on every fingerprint change, and an
-/// item-bound sheet whose identity moved would rebuild the browser's search field under the
-/// keyboard, which is the tearing the global section documents at its own save sheet.
-private struct ShaderPresetBrowserRequest: Identifiable {
-    let id = "shader-preset-browser"
-}
-
 struct PerGameSettingsPanel: View {
     @Environment(\.dismiss) private var dismiss
     @State private var settings = SettingsStore.shared
@@ -438,14 +431,21 @@ struct PerGameSettingsPanel: View {
                 context: perGamePadLayoutEditorContext
             )
         }
-        .sheet(item: $shaderPresetRequest) { _ in
+        .sheet(item: $shaderPresetRequest, onDismiss: {
+            if !perGameShaderPresetRef.isEmpty, ShaderPresetLibrary.resolve(perGameShaderPresetRef) == nil {
+                perGameShaderPresetRef = ""
+            }
+        }) { _ in
             NavigationStack {
                 ShaderPresetBrowserView(
                     title: settings.localized("Shader Presets"),
                     folder: nil,
                     selectedToken: perGameShaderPresetRef,
                     localized: { settings.localized($0) },
-                    onSelect: { perGameShaderPresetRef = $0 }
+                    onSelect: { token in
+                        perGameShaderPresetRef = token
+                        shaderPresetRequest = nil
+                    }
                 )
             }
         }
