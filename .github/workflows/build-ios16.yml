@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.4.1 low memory verifier fix)
+name: Build ARMSX2 for iOS 16 (compat v9.5.1 upstream deployment fix)
 
 on:
   workflow_dispatch:
@@ -29,14 +29,53 @@ jobs:
           cmake = Path('platforms/ios/app/src/main/cpp/CMakeLists.txt')
 
           # 1) Real Mach-O deployment target: iOS 16.0.
+          #
+          # Upstream has changed formatting/version text around this setting
+          # several times. Match the setting semantically instead of requiring
+          # one byte-for-byte CMake line, but still require EXACTLY ONE match so
+          # we never silently patch the wrong location.
           s = cmake.read_text()
-          old = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS deployment target")'
-          new = 'set(ARMSX2_IOS_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS deployment target")'
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise SystemExit('ARMSX2 iOS deployment-target line changed upstream; refusing blind patch.')
+          deployment_re = re.compile(
+              r'(?m)^(?P<indent>[ \t]*)set\s*\(\s*'
+              r'ARMSX2_IOS_DEPLOYMENT_TARGET\s+'
+              r'(?P<quote>["\']?)(?P<version>[0-9]+(?:\.[0-9]+)*)'
+              r'(?P=quote)'
+              r'(?P<tail>\s+CACHE\s+STRING\s+'
+              r'(?P<descquote>["\'])Minimum iOS deployment target(?P=descquote)'
+              r'\s*(?:FORCE\s*)?\))\s*$'
+          )
+          matches = list(deployment_re.finditer(s))
+          if len(matches) != 1:
+              found = [
+                  line.strip()
+                  for line in s.splitlines()
+                  if 'ARMSX2_IOS_DEPLOYMENT_TARGET' in line
+              ]
+              raise SystemExit(
+                  'Expected exactly one ARMSX2_IOS_DEPLOYMENT_TARGET CMake '
+                  f'assignment, found {len(matches)}. Candidate lines: {found}'
+              )
+
+          m = matches[0]
+          original_version = m.group('version')
+          replacement = (
+              f'{m.group("indent")}set(ARMSX2_IOS_DEPLOYMENT_TARGET "16.0" '
+              f'CACHE STRING "Minimum iOS deployment target")'
+          )
+          s = s[:m.start()] + replacement + s[m.end():]
           cmake.write_text(s)
+
+          # Verify the write instead of trusting the substitution.
+          patched = cmake.read_text()
+          verify_matches = list(deployment_re.finditer(patched))
+          if len(verify_matches) != 1 or verify_matches[0].group('version') != '16.0':
+              raise SystemExit(
+                  'Failed to set ARMSX2_IOS_DEPLOYMENT_TARGET to 16.0 safely.'
+              )
+          print(
+              'iOS deployment target patched safely: '
+              f'{original_version} -> 16.0'
+          )
 
           observable_classes = {
               'AppState',
@@ -1918,6 +1957,242 @@ jobs:
           print('V9.4.1 verification passed.')
           PY
 
+      - name: Add Snowblind Metal pipeline trace V9.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm')
+          if not path.is_file():
+              raise SystemExit(f'V9.5 Metal trace: source file missing: {path}')
+
+          text = path.read_text()
+          tag = '// ARMSX2_IOS16_SNOWBLIND_METAL_TRACE_V95'
+          if tag in text:
+              print('V9.5 Metal trace already present; leaving source unchanged.')
+              raise SystemExit(0)
+
+          # Keep this diagnostic independent of the normal renderer log system.
+          # Each line is unbuffered into Documents so a SIGABRT inside Apple's
+          # Metal specialization code cannot eat the last useful selector.
+          include_anchor = '#include "imgui.h"'
+          if include_anchor not in text:
+              raise SystemExit('V9.5 Metal trace: imgui include anchor changed upstream.')
+
+          include_block = '''#include "imgui.h"
+
+          #include <cstdio>
+          #include <ctime>'''
+          text = text.replace(include_anchor, include_block, 1)
+
+          apple_anchor = '''#ifdef __APPLE__
+          #include "GSMTLSharedHeader.h"
+          '''
+          if apple_anchor not in text:
+              raise SystemExit('V9.5 Metal trace: Apple/GSMTLSharedHeader anchor changed upstream.')
+
+          helper = r'''#ifdef __APPLE__
+          #include "GSMTLSharedHeader.h"
+
+          // ARMSX2_IOS16_SNOWBLIND_METAL_TRACE_V95
+          // Diagnostic-only trace for Project Snowblind's iOS 16 Metal crash.
+          // Persist selectors immediately before/after specialization and
+          // pipeline creation so the final incomplete pair identifies the fault.
+          static FILE* s_armsx2_metal_trace_file = nullptr;
+          static bool s_armsx2_metal_trace_attempted = false;
+          static unsigned long long s_armsx2_metal_trace_seq = 0;
+
+          static FILE* ARMSX2GetMetalTraceFile()
+          {
+              if (s_armsx2_metal_trace_attempted)
+                  return s_armsx2_metal_trace_file;
+
+              s_armsx2_metal_trace_attempted = true;
+              @autoreleasepool
+              {
+                  NSString* path = [NSHomeDirectory()
+                      stringByAppendingPathComponent:@"Documents/ARMSX2_MetalPipelineTrace.txt"];
+                  s_armsx2_metal_trace_file = std::fopen([path fileSystemRepresentation], "a");
+                  if (s_armsx2_metal_trace_file)
+                  {
+                      std::setvbuf(s_armsx2_metal_trace_file, nullptr, _IONBF, 0);
+                      std::fprintf(
+                          s_armsx2_metal_trace_file,
+                          "\\n=== V9.5 SESSION unix=%lld ===\\n",
+                          static_cast<long long>(std::time(nullptr)));
+                  }
+              }
+              return s_armsx2_metal_trace_file;
+          }
+
+          static void ARMSX2TraceMetalPipeline(
+              const char* phase,
+              unsigned long long seq,
+              u32 vs_key,
+              u64 ps_hi,
+              u64 ps_lo,
+              u32 extras_key,
+              const GSHWDrawConfig::PSSelector& ps)
+          {
+              FILE* fp = ARMSX2GetMetalTraceFile();
+              if (!fp)
+                  return;
+
+              std::fprintf(
+                  fp,
+                  "%s seq=%llu vs=%08x ps=%016llx:%016llx ex=%08x "
+                  "date=%u atst=%u afail=%u ztst=%u tfx=%u tcc=%u "
+                  "wms=%u wmt=%u fbmask=%u blend=%u/%u/%u/%u hw=%u "
+                  "texfb=%u colclip=%u channel=%u rovC=%u rovD=%u\\n",
+                  phase,
+                  seq,
+                  static_cast<unsigned>(vs_key),
+                  static_cast<unsigned long long>(ps_hi),
+                  static_cast<unsigned long long>(ps_lo),
+                  static_cast<unsigned>(extras_key),
+                  static_cast<unsigned>(ps.date),
+                  static_cast<unsigned>(ps.atst),
+                  static_cast<unsigned>(ps.afail),
+                  static_cast<unsigned>(ps.ztst),
+                  static_cast<unsigned>(ps.tfx),
+                  static_cast<unsigned>(ps.tcc),
+                  static_cast<unsigned>(ps.wms),
+                  static_cast<unsigned>(ps.wmt),
+                  static_cast<unsigned>(ps.fbmask),
+                  static_cast<unsigned>(ps.blend_a),
+                  static_cast<unsigned>(ps.blend_b),
+                  static_cast<unsigned>(ps.blend_c),
+                  static_cast<unsigned>(ps.blend_d),
+                  static_cast<unsigned>(ps.blend_hw),
+                  static_cast<unsigned>(ps.tex_is_fb),
+                  static_cast<unsigned>(ps.colclip_hw),
+                  static_cast<unsigned>(ps.channel),
+                  static_cast<unsigned>(ps.rov_color),
+                  static_cast<unsigned>(ps.rov_depth));
+              std::fflush(fp);
+          }
+          '''
+          text = text.replace(apple_anchor, helper, 1)
+
+          # Cache miss: record the complete selector after the Metal VS key exists.
+          selector_anchor = '''\tVSSelector vssel_mtl;
+          \tvssel_mtl.fst = vssel.fst;
+          \tvssel_mtl.iip = vssel.iip;
+          \tvssel_mtl.point_size = vssel.point_size;
+          \tvssel_mtl.expand = vssel.expand;
+          \tid<MTLFunction> vs = m_hw_vs[vssel_mtl.key];'''
+          if selector_anchor not in text:
+              raise SystemExit('V9.5 Metal trace: VS selector block changed upstream.')
+
+          selector_patch = '''\tVSSelector vssel_mtl;
+          \tvssel_mtl.fst = vssel.fst;
+          \tvssel_mtl.iip = vssel.iip;
+          \tvssel_mtl.point_size = vssel.point_size;
+          \tvssel_mtl.expand = vssel.expand;
+
+          \tconst unsigned long long armsx2_trace_seq = ++s_armsx2_metal_trace_seq;
+          \tARMSX2TraceMetalPipeline(
+          \t\t"SELECTOR", armsx2_trace_seq, vssel_mtl.key,
+          \t\tpssel.key_hi, pssel.key_lo, extras.fullkey, pssel);
+
+          \tid<MTLFunction> vs = m_hw_vs[vssel_mtl.key];'''
+          text = text.replace(selector_anchor, selector_patch, 1)
+
+          # This is the exact operation shown in the crash stack:
+          # _MTLLibrary newFunctionWithName:constantValues -> specialization.
+          ps_anchor = '''\t\tbool eft = pssel.HasColorROV() && !pssel.HasDepthROV() && !pssel.HasDepthOutput();
+          \t\tauto newps = LoadShader(eft ? @"ps_main_rov_eft" : @"ps_main");
+          \t\tps = newps;'''
+          if ps_anchor not in text:
+              raise SystemExit('V9.5 Metal trace: pixel-shader specialization block changed upstream.')
+
+          ps_patch = '''\t\tbool eft = pssel.HasColorROV() && !pssel.HasDepthROV() && !pssel.HasDepthOutput();
+          \t\tARMSX2TraceMetalPipeline(
+          \t\t\t"PS_SPECIALIZE_BEGIN", armsx2_trace_seq, vssel_mtl.key,
+          \t\t\tpssel.key_hi, pssel.key_lo, extras.fullkey, pssel);
+          \t\tauto newps = LoadShader(eft ? @"ps_main_rov_eft" : @"ps_main");
+          \t\tARMSX2TraceMetalPipeline(
+          \t\t\t"PS_SPECIALIZE_OK", armsx2_trace_seq, vssel_mtl.key,
+          \t\t\tpssel.key_hi, pssel.key_lo, extras.fullkey, pssel);
+          \t\tps = newps;'''
+          text = text.replace(ps_anchor, ps_patch, 1)
+
+          # Separate shader specialization from final render-pipeline creation.
+          pipeline_anchor = '''\tNSString* pname = [NSString stringWithFormat:@"HW Render %x.%llx.%llx.%x", vssel_mtl.key, pssel.key_hi, pssel.key_lo, extras.fullkey];
+          \tauto pipeline = MakePipeline(pdesc, vs, ps, pname);
+          \t[m_current_render.encoder setRenderPipelineState:pipeline];'''
+          if pipeline_anchor not in text:
+              raise SystemExit('V9.5 Metal trace: MakePipeline block changed upstream.')
+
+          pipeline_patch = '''\tNSString* pname = [NSString stringWithFormat:@"HW Render %x.%llx.%llx.%x", vssel_mtl.key, pssel.key_hi, pssel.key_lo, extras.fullkey];
+          \tARMSX2TraceMetalPipeline(
+          \t\t"PIPELINE_BEGIN", armsx2_trace_seq, vssel_mtl.key,
+          \t\tpssel.key_hi, pssel.key_lo, extras.fullkey, pssel);
+          \tauto pipeline = MakePipeline(pdesc, vs, ps, pname);
+          \tARMSX2TraceMetalPipeline(
+          \t\t"PIPELINE_OK", armsx2_trace_seq, vssel_mtl.key,
+          \t\tpssel.key_hi, pssel.key_lo, extras.fullkey, pssel);
+          \t[m_current_render.encoder setRenderPipelineState:pipeline];'''
+          text = text.replace(pipeline_anchor, pipeline_patch, 1)
+
+          path.write_text(text)
+          print('Snowblind Metal pipeline trace V9.5 patched successfully.')
+          print('  Runtime trace: Documents/ARMSX2_MetalPipelineTrace.txt')
+          print('  Phases: SELECTOR, PS_SPECIALIZE_BEGIN/OK, PIPELINE_BEGIN/OK')
+          PY
+
+      - name: Verify Snowblind Metal pipeline trace V9.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE='pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm'
+
+          grep -q 'ARMSX2_IOS16_SNOWBLIND_METAL_TRACE_V95' "$FILE"
+          grep -q 'ARMSX2_MetalPipelineTrace.txt' "$FILE"
+          grep -q 'PS_SPECIALIZE_BEGIN' "$FILE"
+          grep -q 'PS_SPECIALIZE_OK' "$FILE"
+          grep -q 'PIPELINE_BEGIN' "$FILE"
+          grep -q 'PIPELINE_OK' "$FILE"
+          grep -q 'std::fflush(fp);' "$FILE"
+
+          # Preserve all previously validated custom behavior.
+          grep -q 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' \
+            pcsx2/Input/SDLInputSource.cpp
+
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('pcsx2/GS/Renderers/Metal/GSDeviceMTL.mm').read_text()
+
+          if s.count('ARMSX2_IOS16_SNOWBLIND_METAL_TRACE_V95') != 1:
+              raise SystemExit('V9.5 Metal trace marker count is not exactly one.')
+          for phase in (
+              '"SELECTOR"',
+              '"PS_SPECIALIZE_BEGIN"',
+              '"PS_SPECIALIZE_OK"',
+              '"PIPELINE_BEGIN"',
+              '"PIPELINE_OK"',
+          ):
+              if phase not in s:
+                  raise SystemExit(f'V9.5 Metal trace phase missing: {phase}')
+
+          if 'auto newps = LoadShader(eft ? @"ps_main_rov_eft" : @"ps_main");' not in s:
+              raise SystemExit('V9.5 accidentally changed/bypassed LoadShader().')
+          if 'auto pipeline = MakePipeline(pdesc, vs, ps, pname);' not in s:
+              raise SystemExit('V9.5 accidentally changed/bypassed MakePipeline().')
+
+          print('Persistent crash-surviving Metal trace: OK')
+          print('Shader specialization path unchanged: OK')
+          print('Pipeline creation path unchanged: OK')
+          print('V9.4.1 Low Memory + V9.3.1/V9.2 controller markers preserved: OK')
+          print('V9.5 verification passed.')
+          PY
+
       - name: Show remaining iOS 17 source markers
         shell: bash
         run: |
@@ -1953,7 +2228,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.4.1-low-memory
+          name: ARMSX2-iOS16-unsigned-v9.5.1-snowblind-metal-trace
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -1961,12 +2236,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.4.1-low-memory
+          name: ARMSX2-iOS16-build-log-v9.5.1-snowblind-metal-trace
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.4.1 low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.4.1-low-memory and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.5.1 Snowblind Metal trace build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.5.1-snowblind-metal-trace and inspect the first real error.' >&2
           exit 1
