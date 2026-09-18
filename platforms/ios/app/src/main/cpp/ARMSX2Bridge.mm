@@ -867,6 +867,8 @@ static MemoryCardFileType ARMSX2MemoryCardFileTypeForSizeMB(NSInteger sizeMB)
 
 static NSData* ARMSX2ReadSaveStatePreviewPNG(const std::string& path)
 {
+    static const zip_uint64_t kMaxPreviewBytes = 8 * 1024 * 1024;
+
     if (path.empty())
         return nil;
 
@@ -880,7 +882,7 @@ static NSData* ARMSX2ReadSaveStatePreviewPNG(const std::string& path)
         return nil;
 
     std::optional<std::vector<u8>> data = ReadBinaryFileInZip(zff.get());
-    if (!data.has_value() || data->empty())
+    if (!data.has_value() || data->empty() || data->size() > kMaxPreviewBytes)
         return nil;
 
     return [NSData dataWithBytes:data->data() length:data->size()];
@@ -2348,8 +2350,9 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
         if (!file)
             continue;
 
+        const zip_uint64_t entryCap = ARMSX2IsControllerSkinImageName(entryName) ? kMaxSkinArchiveEntryBytes : kMaxLooseLayoutBytes;
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty())
+        if (!data.has_value() || data->empty() || data->size() > entryCap)
             continue;
 
         NSString *safeName = ARMSX2SanitizedSkinFileName(entryName);
@@ -2532,6 +2535,8 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
 }
 
 + (nullable NSData *)peekSkinManifestDataAtURL:(NSURL *)archiveURL {
+    static const zip_uint64_t kMaxManifestBytes = 16 * 1024 * 1024;
+
     if (!archiveURL.isFileURL) {
         return nil;
     }
@@ -2564,7 +2569,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
             if (![entryName.lastPathComponent.lowercaseString isEqualToString:wanted]) {
                 continue;
             }
-            if ((stat.valid & ZIP_STAT_SIZE) && stat.size > 16 * 1024 * 1024) {
+            if ((stat.valid & ZIP_STAT_SIZE) && stat.size > kMaxManifestBytes) {
                 continue;
             }
             auto file = zip_fopen_index_managed(zf.get(), i, ZIP_FL_ENC_GUESS);
@@ -2572,7 +2577,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
                 continue;
             }
             std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-            if (!data.has_value() || data->empty()) {
+            if (!data.has_value() || data->empty() || data->size() > kMaxManifestBytes) {
                 continue;
             }
             return [NSData dataWithBytes:data->data() length:data->size()];
@@ -2692,7 +2697,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
             continue;
         }
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty()) {
+        if (!data.has_value() || data->empty() || data->size() > kMaxPackageEntryBytes) {
             continue;
         }
 
@@ -2759,7 +2764,7 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
         if (!file)
             continue;
         std::optional<std::vector<u8>> data = ReadBinaryFileInZip(file.get());
-        if (!data.has_value() || data->empty())
+        if (!data.has_value() || data->empty() || data->size() > kMaxMemcardEntryBytes)
             continue;
 
         NSString *destinationPath = [memcardDir stringByAppendingPathComponent:safeName];
@@ -3044,10 +3049,6 @@ static void ARMSX2RollBackShaderPack(NSArray<NSURL*>* files, NSArray<NSURL*>* di
     if (isoName.length == 0 || ARMSX2PathIsRunningDisc(ARMSX2ResolveISOPath(isoName))) {
         ARMSX2RequestPerGameSettingsReload();
     }
-}
-
-+ (void)setGameSettingsForCurrentGame:(nonnull NSDictionary<NSString *, id> *)settings {
-    [self setGameSettings:settings forISO:nil];
 }
 
 
@@ -3950,40 +3951,8 @@ static void ARMSX2MutatePerGameINI(NSString* isoName, NSString* section, NSStrin
     return [self hasPerGameINIValue:section key:key forISO:nil];
 }
 
-+ (int)getPerGameINIIntForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(int)def {
-    return [self getPerGameINIInt:section key:key defaultValue:def forISO:nil];
-}
-
 + (BOOL)getPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(BOOL)def {
     return [self getPerGameINIBool:section key:key defaultValue:def forISO:nil];
-}
-
-+ (float)getPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(float)def {
-    return [self getPerGameINIFloat:section key:key defaultValue:def forISO:nil];
-}
-
-+ (nonnull NSString *)getPerGameINIStringForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key defaultValue:(nonnull NSString *)def {
-    return [self getPerGameINIString:section key:key defaultValue:def forISO:nil];
-}
-
-+ (void)setPerGameINIIntForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(int)value {
-    [self setPerGameINIInt:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIBoolForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(BOOL)value {
-    [self setPerGameINIBool:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIFloatForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(float)value {
-    [self setPerGameINIFloat:section key:key value:value forISO:nil];
-}
-
-+ (void)setPerGameINIStringForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key value:(nonnull NSString *)value {
-    [self setPerGameINIString:section key:key value:value forISO:nil];
-}
-
-+ (void)deletePerGameINIValueForCurrentGame:(nonnull NSString *)section key:(nonnull NSString *)key {
-    [self deletePerGameINIValue:section key:key forISO:nil];
 }
 
 + (nonnull NSString *)perGameIdentityKeyForISO:(nullable NSString *)isoName {
@@ -4393,19 +4362,11 @@ extern "C" void ARMSX2_ApplyEffectivePresentFPSCap(void)
     return ARMSX2PatchEnableListForIdentity(serial, crc, section, key);
 }
 
-+ (NSArray<NSString *> *)patchEnableListForCurrentGameSection:(NSString *)section key:(NSString *)key {
-    return [self patchEnableListForISO:nil section:section key:key];
-}
-
 + (void)setPatchEnableList:(NSArray<NSString *> *)values forISO:(nullable NSString *)isoName section:(NSString *)section key:(NSString *)key {
     std::string serial;
     u32 crc = 0;
     if (!ARMSX2PerGameIdentityForISO(isoName, &serial, &crc)) return;
     ARMSX2SetPatchEnableListForIdentity(values, serial, crc, section, key);
-}
-
-+ (void)setPatchEnableListForCurrentGame:(NSArray<NSString *> *)values section:(NSString *)section key:(NSString *)key {
-    [self setPatchEnableList:values forISO:nil section:section key:key];
 }
 
 #pragma mark - Memory cards
