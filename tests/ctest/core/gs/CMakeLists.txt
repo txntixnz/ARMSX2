@@ -12,8 +12,7 @@
 # gs_stream_ring_flush_tests.cpp and gs_null_device_profile_tests.cpp ride this
 # target rather than adding one: those policies are header-only, so they need no
 # extra linkage.
-# gs_self_read_road_tests.cpp, gs_date_road_tests.cpp,
-# gs_declared_loop_scope_tests.cpp, gs_dynamic_feedback_loop_tests.cpp,
+# gs_self_read_road_tests.cpp, gs_dynamic_feedback_loop_tests.cpp,
 # gs_stream_ring_memory_tests.cpp, gs_stream_ring_flush_tests.cpp and
 # gs_null_device_profile_tests.cpp ride this target rather than adding one: those
 # policies are header-only, so they need no extra linkage.
@@ -22,6 +21,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_vertex_tests.cpp
 	gs_kick_kernel_tests.cpp
 	gs_backqueue_tests.cpp
+	gs_back_thread_policy_tests.cpp
 	gs_interlace_policy_tests.cpp
 	gs_field_shift_policy_tests.cpp
 	gs_framebuffer_fetch_policy_tests.cpp
@@ -30,8 +30,6 @@ add_pcsx2_test(gs_vertex_tests
 	gs_copy_road_blending_tests.cpp
 	gs_native_texel_grid_tests.cpp
 	gs_self_read_road_tests.cpp
-	gs_date_road_tests.cpp
-	gs_declared_loop_scope_tests.cpp
 	gs_dynamic_feedback_loop_tests.cpp
 	gs_stream_ring_memory_tests.cpp
 	gs_stream_ring_flush_tests.cpp
@@ -41,6 +39,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_snapshot_policy_tests.cpp
 	gs_sw_scanline_cpath_tests.cpp
 	gs_aa1_edge_tests.cpp
+	gs_sw_colour_walk_tables_tests.cpp
 	gs_line_walk_tests.cpp
 	gs_point_place_tests.cpp
 	gs_sw_setup_reciprocal_tests.cpp
@@ -71,6 +70,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sprite_cover_tests.cpp
 	gs_sprite_edge_snap_tests.cpp
 	gs_sprite_pass_order_tests.cpp
+	gs_pass_scheduler_tests.cpp
 	gs_null_device_profile_tests.cpp
 	gs_sw_texture_dirty_tests.cpp
 	gs_blend_constant_policy_tests.cpp
@@ -84,6 +84,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_point_safe_features_tests.cpp
 	gs_field_shift_detector_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
+	gs_sw_palette_block_copy_tests.cpp
 )
 
 target_include_directories(gs_vertex_tests PRIVATE
@@ -91,6 +92,27 @@ target_include_directories(gs_vertex_tests PRIVATE
 )
 
 target_link_libraries(gs_vertex_tests PUBLIC
+	PCSX2_FLAGS
+	PCSX2
+	common
+)
+
+# The palette block copy against the generated scanline, which is what games run. The same source
+# rides gs_vertex_tests too, where there is no code memory and the rasterizer uses its C++ scanline.
+# It is its own binary because reserving code memory switches every later rasterizer in the
+# process to generated code, which the other suites in gs_vertex_tests do not expect.
+add_pcsx2_test(gs_sw_palette_block_copy_jit_tests
+	${CMAKE_CURRENT_SOURCE_DIR}/../StubHost.cpp
+	gs_sw_palette_block_copy_tests.cpp
+)
+
+target_compile_definitions(gs_sw_palette_block_copy_jit_tests PRIVATE GS_PALETTE_COPY_TESTS_JIT=1)
+
+target_include_directories(gs_sw_palette_block_copy_jit_tests PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../../pcsx2
+)
+
+target_link_libraries(gs_sw_palette_block_copy_jit_tests PUBLIC
 	PCSX2_FLAGS
 	PCSX2
 	common

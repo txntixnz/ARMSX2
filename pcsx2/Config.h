@@ -596,10 +596,12 @@ enum class GSDepthFeedbackMode : u8
 	DepthAsRT = 3,
 };
 
-// GV-7 GS front/back split. Off = today's single-threaded path with no record
+// GS front/back split. Off = the single-threaded path with no record
 // round-trip; InlineRecords = build + execute every record on the calling
-// thread (the GV7-0 shape — validation / bisect rung); Lockstep = back thread
-// runs but the front drains after every record; Pipelined = the real thing.
+// thread (a validation / bisect rung); Lockstep = back thread runs but the
+// front drains after every record (a bisect rung); Pipelined = a front thread
+// parses while a back thread draws. GSBackThreadPolicy.h decides what a
+// request resolves to.
 enum class GSBackThreadMode : u8
 {
 	Off           = 0,
@@ -907,14 +909,7 @@ struct Pcsx2Config
 					UseBlitSwapChain : 1,
 					DisableShaderCache : 1,
 					DisableFramebufferFetch : 1,
-					// Pretend the device has no dual-source blend unit, the way every Mali
-					// Vulkan blob reports it. GSRendererHW then takes the SRC1 substitution
-					// and SW-blend fallbacks, so a Mali-only blending bug reproduces on a
-					// desktop GPU instead of needing a device round-trip to see.
-					DisableDualSourceBlend : 1,
-					EnableAdrenoFramebufferFetch : 1,
 					ForceMaliFramebufferFetch : 1,
-					DisablePS2DepthQuantization : 1,
 					DisableVertexShaderExpand : 1,
 					SkipDuplicateFrames : 1,
 					OsdShowSpeed : 1,
@@ -1058,13 +1053,14 @@ struct Pcsx2Config
 		GSLimit24BitDepth UserHacks_Limit24BitDepth = GSLimit24BitDepth::Disabled;
 		GSBilinearDirtyMode UserHacks_BilinearHack = GSBilinearDirtyMode::Automatic;
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
-		/// Whether this title moves its projection half a display line between fields, which decides
-		/// whether the FFMD merge offset is applied when a field render is presented directly at an
-		/// integer upscale of 2 or more. -1 leaves it to the runtime detector, which defaults to 1.
-		s8 FieldShift = -1;
 		s8 OverrideTextureBarriers = -1;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
+		/// The setting, as the user or the game database asked for it.
 		GSBackThreadMode BackThreadMode = GSBackThreadMode::Off;
+		/// What BackThreadMode resolved to for the open renderer. Derived, not loaded or saved, and
+		/// not compared -- set by OpenGSRenderer on GSConfig only, and read by the renderer's
+		/// constructor.
+		GSBackThreadMode BackThreadModeResolved = GSBackThreadMode::Off;
 
 		// RetroArch (.slangp) shader chain, applied at present after ShadeBoost/FXAA via
 		// librashader. Disabled or an empty preset skips the chain entirely (zero cost),
