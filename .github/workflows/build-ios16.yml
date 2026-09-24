@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.5.3 Juiced controls + clean low memory)
+name: Build ARMSX2 for iOS 16 (v9.6.0 A15 performance + Juiced controls)
 
 on:
   workflow_dispatch:
@@ -2277,6 +2277,431 @@ jobs:
           print('V9.4.1 verification passed.')
           PY
 
+      - name: Add iPhone 13 Pro Max A15 Performance V1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build_params = Path('platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake')
+          ios_main = Path('platforms/ios/app/src/main/cpp/ios_main.mm')
+          scene = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
+          mtgs = Path('pcsx2/MTGS.cpp')
+          mtvu = Path('pcsx2/MTVU.cpp')
+          emulator_settings = Path(
+              'platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift'
+          )
+
+          for p in (build_params, ios_main, scene, mtgs, mtvu, emulator_settings):
+              if not p.is_file():
+                  raise SystemExit(f'A15 Perf V1: expected source file missing: {p}')
+
+          # ==============================================================
+          # 1) A15 code generation.
+          #
+          # This workflow is the user's device-specific iPhone 13 Pro Max
+          # build, so use A15 instead of the generic A12 iOS compatibility
+          # baseline. The normal upstream source remains untouched.
+          # ==============================================================
+          bp = build_params.read_text()
+          if 'ARMSX2_IOS16_A15_PERF_V1' not in bp:
+              needle = 'add_compile_options("-mcpu=apple-a12")'
+              if bp.count(needle) != 1:
+                  raise SystemExit(
+                      'A15 Perf V1: expected exactly one apple-a12 iOS compiler flag.'
+                  )
+              bp = bp.replace(
+                  needle,
+                  '# ARMSX2_IOS16_A15_PERF_V1\n'
+                  '\t\t# Device-specific build: iPhone 13 Pro Max / A15.\n'
+                  '\t\tadd_compile_options("-mcpu=apple-a15")',
+                  1,
+              )
+              build_params.write_text(bp)
+
+          # ==============================================================
+          # 2) Settings UI.
+          #
+          # Runtime parts remain switchable. The binary itself stays A15-
+          # targeted because that is a compile-time choice.
+          # ==============================================================
+          ui = emulator_settings.read_text()
+          if '// ARMSX2_IOS16_A15_PERF_UI_V1' not in ui:
+              struct_anchor = 'struct EmulatorSettingsView: View {'
+              if struct_anchor not in ui:
+                  raise SystemExit(
+                      'A15 Perf V1: EmulatorSettingsView declaration changed upstream.'
+                  )
+
+              ui = ui.replace(
+                  struct_anchor,
+                  struct_anchor +
+                  '\n    // ARMSX2_IOS16_A15_PERF_UI_V1'
+                  '\n    @AppStorage("ARMSX2_A15PerformanceProfile")'
+                  ' private var a15PerformanceProfile = true',
+                  1,
+              )
+
+              boot_anchor = '            Section(settings.localized("Boot")) {'
+              if boot_anchor not in ui:
+                  raise SystemExit(
+                      'A15 Perf V1: Boot section anchor changed upstream.'
+                  )
+
+              perf_section = '''            Section {
+                  Toggle(
+                      settings.localized("iPhone 13 Pro Max / A15 Performance"),
+                      isOn: $a15PerformanceProfile
+                  )
+
+                  Text(settings.localized("Optimizes this custom build for A15: a 2.0× Metal presentation cap, 2-frame MTGS queue, lower drawable queue depth, high-priority CPU/GS scheduling, and automatic presentation scaling when iOS reports serious heat. Restart ARMSX2 after changing this switch."))
+                      .font(.caption)
+                      .foregroundStyle(.secondary)
+              } header: {
+                  Text(settings.localized("Device Performance"))
+              } footer: {
+                  Text(settings.localized("This changes presentation/scheduling only; PS2 internal rendering resolution and game timing stay unchanged. The build itself is compiled specifically for Apple A15."))
+              }
+
+'''
+              ui = ui.replace(boot_anchor, perf_section + boot_anchor, 1)
+              emulator_settings.write_text(ui)
+
+          # ==============================================================
+          # 3) Metal presentation path.
+          #
+          # Stock/native presentation remains available with the profile OFF.
+          # ON: cap at 2.0x, 1.75x on serious heat / Low Power Mode,
+          # and 1.5x at critical heat. Internal PS2 resolution is untouched.
+          # ==============================================================
+          im = ios_main.read_text()
+          if '// ARMSX2_IOS16_A15_METAL_V1' not in im:
+              if '#include <cstdlib>' not in im:
+                  include_anchor = '#include <cstring>'
+                  if include_anchor not in im:
+                      raise SystemExit(
+                          'A15 Perf V1: ios_main standard include anchor changed upstream.'
+                      )
+                  im = im.replace(
+                      include_anchor,
+                      include_anchor + '\n#include <cstdlib>',
+                      1,
+                  )
+
+              old_scale = '''- (CGFloat)armsx2NativeContentScale {
+    UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+    CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
+    return scale > 0.0 ? scale : 1.0;
+}
+'''
+              if old_scale not in im:
+                  raise SystemExit(
+                      'A15 Perf V1: ARMSX2GameView native-scale method changed upstream.'
+                  )
+
+              new_scale = '''// ARMSX2_IOS16_A15_METAL_V1
+- (BOOL)armsx2A15PerformanceProfileEnabled {
+    const char* value = std::getenv("ARMSX2_A15_PERFORMANCE");
+    return value && value[0] == '1';
+}
+- (CGFloat)armsx2NativeContentScale {
+    UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+    CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
+    if (scale <= 0.0)
+        scale = 1.0;
+
+    if (![self armsx2A15PerformanceProfileEnabled])
+        return scale;
+
+    CGFloat cap = 2.0;
+    const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
+    if (thermal >= NSProcessInfoThermalStateCritical)
+        cap = 1.5;
+    else if (thermal >= NSProcessInfoThermalStateSerious ||
+             NSProcessInfo.processInfo.lowPowerModeEnabled)
+        cap = 1.75;
+
+    return MIN(scale, cap);
+}
+'''
+              im = im.replace(old_scale, new_scale, 1)
+
+              old_apply = '''- (void)armsx2ApplyNativeContentScale {
+    const CGFloat scale = [self armsx2NativeContentScale];
+    self.contentScaleFactor = scale;
+    self.layer.contentsScale = scale;
+    ((CAMetalLayer*)self.layer).contentsScale = scale;
+}
+'''
+              if old_apply not in im:
+                  raise SystemExit(
+                      'A15 Perf V1: ARMSX2GameView apply-scale method changed upstream.'
+                  )
+
+              new_apply = '''- (void)armsx2ApplyNativeContentScale {
+    const CGFloat scale = [self armsx2NativeContentScale];
+    self.contentScaleFactor = scale;
+    self.layer.contentsScale = scale;
+
+    CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+    metalLayer.contentsScale = scale;
+    metalLayer.presentsWithTransaction = NO;
+    // Two drawables reduces queued presentation work/input latency on the
+    // device profile. Restore the ordinary three-deep path when disabled.
+    metalLayer.maximumDrawableCount =
+        [self armsx2A15PerformanceProfileEnabled] ? 2 : 3;
+}
+'''
+              im = im.replace(old_apply, new_apply, 1)
+              ios_main.write_text(im)
+
+          # ==============================================================
+          # 4) iOS runtime profile: persistence, thermal relayout, MTGS queue,
+          # and CPU-thread QoS.
+          # ==============================================================
+          sc = scene.read_text()
+          if '// ARMSX2_IOS16_A15_RUNTIME_V1' not in sc:
+              if '#include <pthread/qos.h>' not in sc:
+                  include_anchor = '#include <thread>'
+                  if include_anchor not in sc:
+                      raise SystemExit(
+                          'A15 Perf V1: SceneDelegate thread include anchor changed upstream.'
+                      )
+                  sc = sc.replace(
+                      include_anchor,
+                      include_anchor + '\n#include <pthread/qos.h>',
+                      1,
+                  )
+
+              scene_anchor = '    UIWindowScene *windowScene = (UIWindowScene *)scene;\n'
+              if scene_anchor not in sc:
+                  raise SystemExit(
+                      'A15 Perf V1: UIWindowScene anchor changed upstream.'
+                  )
+              boot_profile = '''    // ARMSX2_IOS16_A15_RUNTIME_V1
+    NSUserDefaults *armsx2PerfDefaults = [NSUserDefaults standardUserDefaults];
+    const BOOL armsx2A15Performance =
+        [armsx2PerfDefaults objectForKey:@"ARMSX2_A15PerformanceProfile"] ?
+            [armsx2PerfDefaults boolForKey:@"ARMSX2_A15PerformanceProfile"] : YES;
+    setenv("ARMSX2_A15_PERFORMANCE", armsx2A15Performance ? "1" : "0", 1);
+    NSLog(@"[A15] iPhone 13 Pro Max performance profile: %@",
+          armsx2A15Performance ? @"ON" : @"OFF");
+
+'''
+              sc = sc.replace(scene_anchor, scene_anchor + boot_profile, 1)
+
+              view_anchor = '''        g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
+        g_gameRenderView.backgroundColor = [UIColor blackColor];
+        g_gameRenderView.clipsToBounds = YES;
+'''
+              if view_anchor not in sc:
+                  raise SystemExit(
+                      'A15 Perf V1: game render view creation anchor changed upstream.'
+                  )
+              view_extra = '''        g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
+        g_gameRenderView.backgroundColor = [UIColor blackColor];
+        g_gameRenderView.clipsToBounds = YES;
+
+        // Re-evaluate the presentation cap immediately when iOS changes
+        // thermal or Low Power state. The observer lives for the app scene.
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                        object:[NSProcessInfo processInfo]
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification * _Nonnull note) {
+                        if (g_gameRenderView)
+                            [g_gameRenderView setNeedsLayout];
+                    }];
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSProcessInfoPowerStateDidChangeNotification
+                        object:[NSProcessInfo processInfo]
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification * _Nonnull note) {
+                        if (g_gameRenderView)
+                            [g_gameRenderView setNeedsLayout];
+                    }];
+'''
+              sc = sc.replace(view_anchor, view_extra, 1)
+
+              startup_anchor = '    VMManager::Internal::LoadStartupSettings();\n'
+              if startup_anchor not in sc:
+                  raise SystemExit(
+                      'A15 Perf V1: startup-settings anchor changed upstream.'
+                  )
+              queue_patch = '''    VMManager::Internal::LoadStartupSettings();
+    if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+        armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)
+    {
+        Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);
+        EmuConfig.GS.VsyncQueueSize = 2;
+    }
+'''
+              sc = sc.replace(startup_anchor, queue_patch, 1)
+
+              vm_anchor = '''    std::thread vmThread([]() {
+        // === ONE-TIME INIT (runs once per app lifetime) ===
+        s_cpuThreadId = std::this_thread::get_id();
+'''
+              if vm_anchor not in sc:
+                  raise SystemExit(
+                      'A15 Perf V1: persistent VM-thread anchor changed upstream.'
+                  )
+              vm_qos = '''    std::thread vmThread([]() {
+        // === ONE-TIME INIT (runs once per app lifetime) ===
+        s_cpuThreadId = std::this_thread::get_id();
+        if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+            armsx2_perf && armsx2_perf[0] == '1')
+        {
+            const int qos_result =
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            std::fprintf(stderr, "@@A15_QOS@@ thread=CPU class=user_interactive result=%d\\n",
+                         qos_result);
+            std::fflush(stderr);
+        }
+'''
+              sc = sc.replace(vm_anchor, vm_qos, 1)
+              scene.write_text(sc)
+
+          # ==============================================================
+          # 5) GS and MTVU QoS.
+          #
+          # GS is presentation-critical; MTVU is important but kept one class
+          # lower so it cannot unnecessarily fight the EE/GS pair.
+          # ==============================================================
+          gs = mtgs.read_text()
+          if '// ARMSX2_IOS16_A15_GS_QOS_V1' not in gs:
+              if '#include <cstdlib>' not in gs:
+                  gs = gs.replace('#include <list>', '#include <cstdlib>\n#include <list>', 1)
+              if '#include <pthread/qos.h>' not in gs:
+                  gs = gs.replace(
+                      '#include <vector>',
+                      '#include <vector>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif',
+                      1,
+                  )
+              gs_anchor = '''void MTGS::ThreadEntryPoint()
+{
+\tThreading::SetNameOfCurrentThread("GS");
+'''
+              if gs_anchor not in gs:
+                  raise SystemExit(
+                      'A15 Perf V1: MTGS ThreadEntryPoint anchor changed upstream.'
+                  )
+              gs_patch = '''void MTGS::ThreadEntryPoint()
+{
+\tThreading::SetNameOfCurrentThread("GS");
+#if defined(__APPLE__)
+\t// ARMSX2_IOS16_A15_GS_QOS_V1
+\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+\t\tarmsx2_perf && armsx2_perf[0] == '1')
+\t{
+\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+\t}
+#endif
+'''
+              gs = gs.replace(gs_anchor, gs_patch, 1)
+              mtgs.write_text(gs)
+
+          vu = mtvu.read_text()
+          if '// ARMSX2_IOS16_A15_MTVU_QOS_V1' not in vu:
+              if '#include <cstdlib>' not in vu:
+                  vu = vu.replace('#include <thread>', '#include <cstdlib>\n#include <thread>', 1)
+              if '#include <pthread/qos.h>' not in vu:
+                  vu = vu.replace(
+                      '#include <thread>',
+                      '#include <thread>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif',
+                      1,
+                  )
+              vu_anchor = '''void VU_Thread::ExecuteRingBuffer()
+{
+\tThreading::SetNameOfCurrentThread("MTVU");
+'''
+              if vu_anchor not in vu:
+                  raise SystemExit(
+                      'A15 Perf V1: MTVU ExecuteRingBuffer anchor changed upstream.'
+                  )
+              vu_patch = '''void VU_Thread::ExecuteRingBuffer()
+{
+\tThreading::SetNameOfCurrentThread("MTVU");
+#if defined(__APPLE__)
+\t// ARMSX2_IOS16_A15_MTVU_QOS_V1
+\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+\t\tarmsx2_perf && armsx2_perf[0] == '1')
+\t{
+\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+\t}
+#endif
+'''
+              vu = vu.replace(vu_anchor, vu_patch, 1)
+              mtvu.write_text(vu)
+
+          print('A15 Performance V1 patch applied.')
+          print('  CPU target: apple-a15')
+          print('  Presentation: 2.0x normal / 1.75x hot-low-power / 1.5x critical')
+          print('  CAMetalLayer drawable queue: 2')
+          print('  MTGS VSync queue cap: 2')
+          print('  QoS: CPU+GS user-interactive, MTVU user-initiated')
+          print('  Existing PCSX2-core LTO remains enabled by generate-ios-xcode.sh')
+          PY
+
+      - name: Verify iPhone 13 Pro Max A15 Performance V1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q 'ARMSX2_IOS16_A15_PERF_V1' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
+          grep -q 'add_compile_options("-mcpu=apple-a15")' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
+          if grep -q 'add_compile_options("-mcpu=apple-a12")' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake; then
+            echo 'ERROR: generic apple-a12 compiler target still active.' >&2
+            exit 1
+          fi
+
+          grep -q 'ARMSX2_IOS16_A15_PERF_UI_V1' \
+            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
+          grep -q 'ARMSX2_A15PerformanceProfile' \
+            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
+
+          grep -q 'ARMSX2_IOS16_A15_METAL_V1' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+          grep -q 'maximumDrawableCount' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+          grep -q 'NSProcessInfoThermalStateSerious' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+
+          grep -q 'ARMSX2_IOS16_A15_RUNTIME_V1' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q 'EmuConfig.GS.VsyncQueueSize = 2;' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q 'QOS_CLASS_USER_INTERACTIVE' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+
+          grep -q 'ARMSX2_IOS16_A15_GS_QOS_V1' pcsx2/MTGS.cpp
+          grep -q 'QOS_CLASS_USER_INTERACTIVE' pcsx2/MTGS.cpp
+          grep -q 'ARMSX2_IOS16_A15_MTVU_QOS_V1' pcsx2/MTVU.cpp
+          grep -q 'QOS_CLASS_USER_INITIATED' pcsx2/MTVU.cpp
+
+          # LTO was already enabled in the device generator; keep it on.
+          grep -q -- '-DLTO_PCSX2_CORE=ON' \
+            platforms/ios/scripts/generate-ios-xcode.sh
+
+          # Regression guards for the field-tested custom features.
+          grep -q 'ARMSX2_IOS16_JUICED_NATIVE_V953' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+
+          echo 'A15 target: OK'
+          echo 'PCSX2-core LTO: ON'
+          echo '2.0x thermally adaptive Metal presentation: OK'
+          echo '2-deep Metal drawable queue: OK'
+          echo '2-frame MTGS queue cap: OK'
+          echo 'CPU/GS/MTVU QoS tuning: OK'
+          echo 'Juiced / GT4 / analog tuning preserved: OK'
+          echo 'Low Memory Mode left independent and untouched: OK'
+
       - name: Show remaining iOS 17 source markers
         shell: bash
         run: |
@@ -2312,7 +2737,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.5.3-juiced-controls-low-memory
+          name: ARMSX2-iOS16-unsigned-v9.6.0-a15-performance
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2320,12 +2745,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory
+          name: ARMSX2-iOS16-build-log-v9.6.0-a15-performance
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.5.3 Juiced-controls low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.6.0 A15-performance build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.0-a15-performance and inspect the first real error.' >&2
           exit 1
