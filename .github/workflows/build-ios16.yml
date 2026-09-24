@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (compat v9.5.2 clean low memory)
+name: Build ARMSX2 for iOS 16 (compat v9.5.3 Juiced controls + clean low memory)
 
 on:
   workflow_dispatch:
@@ -1682,6 +1682,326 @@ jobs:
           print('V9.3.1 verification passed.')
           PY
 
+      - name: Add Juiced controller remap V9.5.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          swift_path = Path('platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift')
+          scene_path = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
+          sdl_path = Path('pcsx2/Input/SDLInputSource.cpp')
+
+          for path in (swift_path, scene_path, sdl_path):
+              if not path.is_file():
+                  raise SystemExit(
+                      f'Juiced V9.5.3: expected source file missing: {path}'
+                  )
+
+          # ==============================================================
+          # SwiftUI: a completely separate setting. It does not reuse the
+          # GT4 Analog Trigger Pedals switch or the Low Memory Mode switch.
+          # ==============================================================
+          swift_tag = '// ARMSX2_IOS16_JUICED_CONTROLS_V953'
+          swift = swift_path.read_text()
+
+          if swift_tag not in swift:
+              struct_anchor = 'struct GamepadSettingsView: View {'
+              if struct_anchor not in swift:
+                  raise SystemExit(
+                      'Juiced V9.5.3: GamepadSettingsView declaration changed upstream.'
+                  )
+
+              helper = '''// ARMSX2_IOS16_JUICED_CONTROLS_V953
+          private func armsx2SetJuicedControlsEnvironment(_ enabled: Bool) {
+              let value = enabled ? "1" : "0"
+              "ARMSX2_JUICED_CONTROLS".withCString { key in
+                  value.withCString { rawValue in
+                      _ = setenv(key, rawValue, 1)
+                  }
+              }
+          }
+
+          '''
+              swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
+
+              storage_anchor = (
+                  '    @AppStorage("ARMSX2_GT4TriggerPedals") '
+                  'private var gt4TriggerPedals = false\n'
+              )
+              if storage_anchor not in swift:
+                  raise SystemExit(
+                      'Juiced V9.5.3: GT4 trigger-pedal storage anchor is missing.'
+                  )
+
+              swift = swift.replace(
+                  storage_anchor,
+                  storage_anchor +
+                  '    @AppStorage("ARMSX2_JuicedControls") '
+                  'private var juicedControls = false\n',
+                  1,
+              )
+
+              rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
+              if rumble_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: Game Controller Tools section changed upstream.'
+                  )
+              tools_section_pos = swift.rfind('Section {', 0, rumble_pos)
+              if tools_section_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: could not locate Tools section.'
+                  )
+
+              juiced_section = '''Section {
+                      Toggle(isOn: Binding(
+                          get: { juicedControls },
+                          set: { enabled in
+                              juicedControls = enabled
+                              armsx2SetJuicedControlsEnvironment(enabled)
+                          }
+                      )) {
+                          Label {
+                              VStack(alignment: .leading, spacing: 3) {
+                                  Text("R1/L1 Shifter")
+                                  Text("R1 = Up · L1 = Down · □ = Nitrous · X = Rear View")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                          } icon: {
+                              Image(systemName: "gearshape.2")
+                          }
+                      }
+                  } header: {
+                      Text("Juiced Controls")
+                  } footer: {
+                      Text("Remaps physical R1 → PS2 R2, L1 → PS2 L2, Square → PS2 R1 and Cross → PS2 L1. Use together with Analog Trigger Pedals for R2 throttle and L2 brake. This setting is independent from Gran Turismo 4 and Low Memory Mode.")
+                  }
+
+                  '''
+              swift = (
+                  swift[:tools_section_pos] +
+                  juiced_section +
+                  swift[tools_section_pos:]
+              )
+              swift_path.write_text(swift)
+
+          # ==============================================================
+          # Cold-launch persistence.
+          # ==============================================================
+          scene_tag = '// ARMSX2_IOS16_JUICED_CONTROLS_BOOT_V953'
+          scene = scene_path.read_text()
+
+          if scene_tag not in scene:
+              init_anchor = '// --- SDL Initialization ---'
+              init_pos = scene.find(init_anchor)
+              if init_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: SceneDelegate SDL initialization marker changed upstream.'
+                  )
+
+              boot = '''// ARMSX2_IOS16_JUICED_CONTROLS_BOOT_V953
+          const BOOL armsx2JuicedControlsEnabled =
+              [[NSUserDefaults standardUserDefaults] boolForKey:@"ARMSX2_JuicedControls"];
+          setenv("ARMSX2_JUICED_CONTROLS",
+                 armsx2JuicedControlsEnabled ? "1" : "0", 1);
+          NSLog(@"[Gamepad] Juiced controls: %@",
+                armsx2JuicedControlsEnabled ? @"ON" : @"OFF");
+
+          '''
+              scene = scene[:init_pos] + boot + scene[init_pos:]
+              scene_path.write_text(scene)
+
+          # ==============================================================
+          # Native input remap.
+          #
+          # Physical -> emulated PS2:
+          #   R1     -> R2   (Juiced gear up)
+          #   L1     -> L2   (Juiced gear down)
+          #   Square -> R1   (Juiced nitrous)
+          #   Cross  -> L1   (Juiced rear view)
+          #
+          # The four physical button events are consumed while enabled so
+          # their stock PS2 actions cannot fire at the same time.
+          # ==============================================================
+          native_tag = '// ARMSX2_IOS16_JUICED_NATIVE_V953'
+          sdl = sdl_path.read_text()
+
+          if native_tag not in sdl:
+              if '#include "SIO/Pad/Pad.h"' not in sdl:
+                  raise SystemExit(
+                      'Juiced V9.5.3: expected GT4 Pad.h include is missing.'
+                  )
+              if '#include <cstdlib>' not in sdl:
+                  raise SystemExit(
+                      'Juiced V9.5.3: expected cstdlib include is missing.'
+                  )
+
+              function_anchor = 'bool SDLInputSource::HandleGamepadButtonEvent(const SDL_GamepadButtonEvent* ev)'
+              function_pos = sdl.find(function_anchor)
+              if function_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: HandleGamepadButtonEvent changed upstream.'
+                  )
+
+              helper = '''// ARMSX2_IOS16_JUICED_NATIVE_V953
+          static bool ARMSX2JuicedControlsEnabled()
+          {
+              const char* value = std::getenv("ARMSX2_JUICED_CONTROLS");
+              return value && value[0] == '1';
+          }
+
+          static bool ARMSX2JuicedSetPS2Button(
+              u32 pad_index, GenericInputBinding target, float value)
+          {
+              if (pad_index >= Pad::NUM_CONTROLLER_PORTS)
+                  return false;
+
+              const Pad::ControllerInfo* info =
+                  Pad::GetControllerInfo(EmuConfig.Pad.Ports[pad_index].Type);
+              if (!info)
+                  return false;
+
+              for (const InputBindingInfo& bi : info->bindings)
+              {
+                  if (bi.generic_mapping == target)
+                  {
+                      Pad::SetControllerState(pad_index, bi.bind_index, value);
+                      return true;
+                  }
+              }
+
+              return false;
+          }
+
+          '''
+              sdl = sdl[:function_pos] + helper + sdl[function_pos:]
+
+              function_pos = sdl.find(function_anchor)
+              if function_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: HandleGamepadButtonEvent vanished after helper insertion.'
+                  )
+
+              dispatch_anchor = (
+                  '\tconst InputBindingKey key(MakeGenericControllerButtonKey('
+                  'InputSourceType::SDL, it->player_id, ev->button));\n'
+              )
+              dispatch_pos = sdl.find(dispatch_anchor, function_pos)
+              if dispatch_pos < 0:
+                  raise SystemExit(
+                      'Juiced V9.5.3: stock gamepad-button dispatch point changed upstream.'
+                  )
+
+              remap = '''\t// Juiced V9.5.3: consume these four physical buttons and write
+          \t// the desired DualShock 2 controls directly. R2/L2 trigger axes are
+          \t// deliberately untouched here; Analog Trigger Pedals remains a
+          \t// completely separate setting.
+          \tif (ARMSX2JuicedControlsEnabled() && it->gamepad &&
+          \t\tit->player_id >= 0 &&
+          \t\tit->player_id < static_cast<int>(Pad::NUM_CONTROLLER_PORTS))
+          \t{
+          \t\tGenericInputBinding target = GenericInputBinding::Unknown;
+          \t\tswitch (ev->button)
+          \t\t{
+          \t\t\tcase SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+          \t\t\t\ttarget = GenericInputBinding::R2;
+          \t\t\t\tbreak;
+          \t\t\tcase SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+          \t\t\t\ttarget = GenericInputBinding::L2;
+          \t\t\t\tbreak;
+          \t\t\tcase SDL_GAMEPAD_BUTTON_WEST:
+          \t\t\t\ttarget = GenericInputBinding::R1;
+          \t\t\t\tbreak;
+          \t\t\tcase SDL_GAMEPAD_BUTTON_SOUTH:
+          \t\t\t\ttarget = GenericInputBinding::L1;
+          \t\t\t\tbreak;
+          \t\t\tdefault:
+          \t\t\t\tbreak;
+          \t\t}
+
+          \t\tif (target != GenericInputBinding::Unknown)
+          \t\t{
+          \t\t\tARMSX2JuicedSetPS2Button(
+          \t\t\t\tstatic_cast<u32>(it->player_id), target,
+          \t\t\t\tev->down ? 1.0f : 0.0f);
+          \t\t\treturn true;
+          \t\t}
+          \t}
+
+          '''
+              sdl = sdl[:dispatch_pos] + remap + sdl[dispatch_pos:]
+              sdl_path.write_text(sdl)
+
+          print('Juiced controller remap V9.5.3 patched successfully.')
+          print(f'  Runtime toggle: {swift_path}')
+          print(f'  Cold-launch persistence: {scene_path}')
+          print(f'  Native input remap: {sdl_path}')
+          PY
+
+      - name: Verify Juiced controller remap V9.5.3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q 'ARMSX2_IOS16_JUICED_CONTROLS_V953' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q '@AppStorage("ARMSX2_JuicedControls")' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q 'private var juicedControls = false' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q 'Text("R1/L1 Shifter")' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q 'ARMSX2_JUICED_CONTROLS' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q 'ARMSX2_IOS16_JUICED_NATIVE_V953' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'target = GenericInputBinding::R2;' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'SDL_GAMEPAD_BUTTON_LEFT_SHOULDER' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'target = GenericInputBinding::L2;' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'SDL_GAMEPAD_BUTTON_WEST' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'target = GenericInputBinding::R1;' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'SDL_GAMEPAD_BUTTON_SOUTH' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'target = GenericInputBinding::L1;' \
+            pcsx2/Input/SDLInputSource.cpp
+
+          # Regression guards: keep the field-proven GT4 path independent.
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q '@AppStorage("ARMSX2_GT4TriggerPedals")' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+
+          python3 - <<'PY'
+          mapping = {
+              'R1': 'R2',
+              'L1': 'L2',
+              'Square': 'R1',
+              'Cross': 'L1',
+          }
+          expected = {
+              'R1': 'R2',
+              'L1': 'L2',
+              'Square': 'R1',
+              'Cross': 'L1',
+          }
+          if mapping != expected:
+              raise SystemExit('Juiced V9.5.3 mapping regression.')
+          print('Juiced mapping: R1→R2, L1→L2, Square→R1, Cross→L1: OK')
+          print('GT4 Analog Trigger Pedals remains independent: OK')
+          print('Juiced V9.5.3 verification passed.')
+          PY
+
       - name: Add iPhone Low Memory Mode V9.4
         shell: bash
         run: |
@@ -1992,7 +2312,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.5.2-clean-low-memory
+          name: ARMSX2-iOS16-unsigned-v9.5.3-juiced-controls-low-memory
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2000,12 +2320,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.5.2-clean-low-memory
+          name: ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.5.2 clean low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.5.2-clean-low-memory and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.5.3 Juiced-controls low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory and inspect the first real error.' >&2
           exit 1
