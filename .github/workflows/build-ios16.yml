@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (v9.6.0 A15 performance + Juiced controls)
+name: Build ARMSX2 for iOS 16 (compat v9.5.3 Juiced controls + clean low memory)
 
 on:
   workflow_dispatch:
@@ -2002,340 +2002,280 @@ jobs:
           print('Juiced V9.5.3 verification passed.')
           PY
 
-      - name: Add iPhone 13 Pro Max A15 Performance V1
+      - name: Add iPhone Low Memory Mode V9.4
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           import re
-          import textwrap
 
-          build_params = Path('platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake')
-          ios_main = Path('platforms/ios/app/src/main/cpp/ios_main.mm')
-          scene = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
-          mtgs = Path('pcsx2/MTGS.cpp')
-          mtvu = Path('pcsx2/MTVU.cpp')
-          emulator_settings = Path(
-              'platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift'
-          )
+          swift_path = Path('platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift')
+          scene_path = Path('platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm')
+          renderer_path = Path('pcsx2/GS/Renderers/HW/GSRendererHW.cpp')
 
-          for p in (build_params, ios_main, scene, mtgs, mtvu, emulator_settings):
-              if not p.is_file():
-                  raise SystemExit(f'A15 Perf V1: expected source file missing: {p}')
-
-          # 1) Compile specifically for Apple A15.
-          bp = build_params.read_text()
-          if 'ARMSX2_IOS16_A15_PERF_V1' not in bp:
-              needle = 'add_compile_options("-mcpu=apple-a12")'
-              if bp.count(needle) != 1:
+          for path in (swift_path, scene_path, renderer_path):
+              if not path.is_file():
                   raise SystemExit(
-                      'A15 Perf V1: expected exactly one apple-a12 iOS compiler flag.'
+                      f'Low Memory V9.4: expected source file missing: {path}'
                   )
-              bp = bp.replace(
-                  needle,
-                  '# ARMSX2_IOS16_A15_PERF_V1\n'
-                  '\t\t# Device-specific build: iPhone 13 Pro Max / A15.\n'
-                  '\t\tadd_compile_options("-mcpu=apple-a15")',
+
+          # ==============================================================
+          # SwiftUI toggle. This intentionally lives on the already-patched
+          # Game Controller page so the iOS 16 build does not depend on an
+          # upstream settings-navigation layout which may change frequently.
+          # ==============================================================
+          swift_tag = '// ARMSX2_IOS16_LOW_MEMORY_MODE_V94'
+          swift = swift_path.read_text()
+
+          if swift_tag not in swift:
+              struct_anchor = 'struct GamepadSettingsView: View {'
+              if struct_anchor not in swift:
+                  raise SystemExit(
+                      'Low Memory V9.4: GamepadSettingsView declaration changed upstream.'
+                  )
+
+              helper = '''// ARMSX2_IOS16_LOW_MEMORY_MODE_V94
+          private func armsx2SetLowMemoryEnvironment(_ enabled: Bool) {
+              let value = enabled ? "1" : "0"
+              "ARMSX2_LOW_MEMORY_MODE".withCString { key in
+                  value.withCString { rawValue in
+                      _ = setenv(key, rawValue, 1)
+                  }
+              }
+          }
+
+          '''
+              swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
+
+              # Anchor on the field-proven V9.3.1 tuning property so the RAM
+              # feature can never silently replace the controller changes.
+              storage_anchor = (
+                  '    @AppStorage("ARMSX2_GT4TriggerFullThreshold") '
+                  'private var gt4TriggerFullThreshold = 1.0\n'
+              )
+              if storage_anchor not in swift:
+                  raise SystemExit(
+                      'Low Memory V9.4: V9.3.1 GT4 tuning storage anchor is missing.'
+                  )
+
+              swift = swift.replace(
+                  storage_anchor,
+                  storage_anchor +
+                  '    @AppStorage("ARMSX2_LowMemoryMode") '
+                  'private var lowMemoryMode = true\n',
                   1,
               )
-              build_params.write_text(bp)
 
-          # 2) Add a runtime master switch. Compile-time A15 targeting remains
-          # device-specific regardless of this switch.
-          ui = emulator_settings.read_text()
-          if '// ARMSX2_IOS16_A15_PERF_UI_V1' not in ui:
-              struct_anchor = 'struct EmulatorSettingsView: View {'
-              if struct_anchor not in ui:
+              # Put the switch immediately before the existing controller Tools
+              # section. This avoids adding any new NavigationLink/destination
+              # (important for our iOS 16 SwiftUI compatibility branch).
+              rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
+              if rumble_pos < 0:
                   raise SystemExit(
-                      'A15 Perf V1: EmulatorSettingsView declaration changed upstream.'
+                      'Low Memory V9.4: Game Controller Tools section changed upstream.'
                   )
-              ui = ui.replace(
-                  struct_anchor,
-                  struct_anchor +
-                  '\n    // ARMSX2_IOS16_A15_PERF_UI_V1'
-                  '\n    @AppStorage("ARMSX2_A15PerformanceProfile")'
-                  ' private var a15PerformanceProfile = true',
-                  1,
-              )
+              tools_section_pos = swift.rfind('Section {', 0, rumble_pos)
+              if tools_section_pos < 0:
+                  raise SystemExit(
+                      'Low Memory V9.4: could not locate Tools section.'
+                  )
 
-              boot_anchor = '            Section(settings.localized("Boot")) {'
-              if boot_anchor not in ui:
-                  raise SystemExit('A15 Perf V1: Boot section anchor changed upstream.')
-
-              perf_section = textwrap.dedent("""\
-                  Section {
-                      Toggle(
-                          settings.localized("iPhone 13 Pro Max / A15 Performance"),
-                          isOn: $a15PerformanceProfile
-                      )
-
-                      Text(settings.localized("Optimizes this custom build for A15: a 2.0× Metal presentation cap, 2-frame MTGS queue, lower drawable queue depth, high-priority CPU/GS scheduling, and automatic presentation scaling when iOS reports serious heat. Restart ARMSX2 after changing this switch."))
-                          .font(.caption)
-                          .foregroundStyle(.secondary)
+              memory_section = '''Section {
+                      Toggle(isOn: Binding(
+                          get: { lowMemoryMode },
+                          set: { enabled in
+                              lowMemoryMode = enabled
+                              armsx2SetLowMemoryEnvironment(enabled)
+                          }
+                      )) {
+                          Label {
+                              VStack(alignment: .leading, spacing: 3) {
+                                  Text("Low Memory Mode")
+                                  Text("Recommended for 6 GB iPhones")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                          } icon: {
+                              Image(systemName: "memorychip")
+                          }
+                      }
                   } header: {
-                      Text(settings.localized("Device Performance"))
+                      Text("iPhone Memory")
                   } footer: {
-                      Text(settings.localized("This changes presentation/scheduling only; PS2 internal rendering resolution and game timing stay unchanged. The build itself is compiled specifically for Apple A15."))
+                      Text("Keeps image quality unchanged. When enabled, ARMSX2 purges the GS texture hash cache at about 384 MB instead of waiting for about 1 GB, and releases the renderer's pooled textures at the same time. This can trade a little extra texture re-upload work for much lower peak RAM use.")
                   }
 
-              """)
-              ui = ui.replace(boot_anchor, perf_section + boot_anchor, 1)
-              emulator_settings.write_text(ui)
-
-          # 3) Metal presentation path. Use regex boundaries rather than exact
-          # indentation so future harmless formatting changes do not break the job.
-          im = ios_main.read_text()
-          if '// ARMSX2_IOS16_A15_METAL_V1' not in im:
-              scale_re = re.compile(
-                  r'(?ms)^- \(CGFloat\)armsx2NativeContentScale \{.*?^\}\n'
-                  r'(?=- \(void\)armsx2ApplyNativeContentScale)'
+                  '''
+              swift = (
+                  swift[:tools_section_pos] +
+                  memory_section +
+                  swift[tools_section_pos:]
               )
-              scale_matches = list(scale_re.finditer(im))
-              if len(scale_matches) != 1:
+              swift_path.write_text(swift)
+
+          # ==============================================================
+          # Cold-launch persistence. The setting defaults ON for this custom
+          # iPhone build, but remains user-switchable at runtime.
+          # ==============================================================
+          scene_tag = '// ARMSX2_IOS16_LOW_MEMORY_BOOT_V94'
+          scene = scene_path.read_text()
+
+          if scene_tag not in scene:
+              init_anchor = '// --- SDL Initialization ---'
+              init_pos = scene.find(init_anchor)
+              if init_pos < 0:
                   raise SystemExit(
-                      f'A15 Perf V1: expected one native-scale method, found {len(scale_matches)}.'
+                      'Low Memory V9.4: SceneDelegate SDL initialization marker changed upstream.'
                   )
-              new_scale = textwrap.dedent("""\
-                  // ARMSX2_IOS16_A15_METAL_V1
-                  - (BOOL)armsx2A15PerformanceProfileEnabled {
-                      const char* value = std::getenv("ARMSX2_A15_PERFORMANCE");
-                      return value && value[0] == '1';
-                  }
-                  - (CGFloat)armsx2NativeContentScale {
-                      UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
-                      CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
-                      if (scale <= 0.0)
-                          scale = 1.0;
 
-                      if (![self armsx2A15PerformanceProfileEnabled])
-                          return scale;
+              boot = '''// ARMSX2_IOS16_LOW_MEMORY_BOOT_V94
+          NSUserDefaults *armsx2MemoryDefaults = [NSUserDefaults standardUserDefaults];
+          const BOOL armsx2LowMemoryEnabled =
+              [armsx2MemoryDefaults objectForKey:@"ARMSX2_LowMemoryMode"] ?
+                  [armsx2MemoryDefaults boolForKey:@"ARMSX2_LowMemoryMode"] : YES;
+          setenv("ARMSX2_LOW_MEMORY_MODE", armsx2LowMemoryEnabled ? "1" : "0", 1);
+          NSLog(@"[Memory] Low Memory Mode: %@ (GS hash cache limit: %@)",
+                armsx2LowMemoryEnabled ? @"ON" : @"OFF",
+                armsx2LowMemoryEnabled ? @"384 MB" : @"1 GB stock");
 
-                      CGFloat cap = 2.0;
-                      const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
-                      if (thermal >= NSProcessInfoThermalStateCritical)
-                          cap = 1.5;
-                      else if (thermal >= NSProcessInfoThermalStateSerious ||
-                               NSProcessInfo.processInfo.lowPowerModeEnabled)
-                          cap = 1.75;
+          '''
+              scene = scene[:init_pos] + boot + scene[init_pos:]
+              scene_path.write_text(scene)
 
-                      return MIN(scale, cap);
-                  }
-              """)
-              im = scale_re.sub(new_scale, im, count=1)
+          # ==============================================================
+          # Native renderer: reuse PCSX2's existing, proven hash-cache
+          # overflow cleanup. We only make its threshold conditional.
+          #
+          # Stock behavior is preserved exactly when the toggle is OFF:
+          #     1024 MB -> RemoveAll(sources+hash) -> PurgePool -> Partial
+          # Low Memory Mode changes only the trigger point to 384 MB.
+          # ==============================================================
+          native_tag = '// ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94'
+          renderer = renderer_path.read_text()
 
-              apply_re = re.compile(
-                  r'(?ms)^- \(void\)armsx2ApplyNativeContentScale \{.*?^\}\n'
-                  r'(?=- \(void\)layoutSubviews)'
-              )
-              apply_matches = list(apply_re.finditer(im))
-              if len(apply_matches) != 1:
-                  raise SystemExit(
-                      f'A15 Perf V1: expected one apply-scale method, found {len(apply_matches)}.'
-                  )
-              new_apply = textwrap.dedent("""\
-                  - (void)armsx2ApplyNativeContentScale {
-                      const CGFloat scale = [self armsx2NativeContentScale];
-                      self.contentScaleFactor = scale;
-                      self.layer.contentsScale = scale;
-
-                      CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
-                      metalLayer.contentsScale = scale;
-                      metalLayer.presentsWithTransaction = NO;
-                      metalLayer.maximumDrawableCount =
-                          [self armsx2A15PerformanceProfileEnabled] ? 2 : 3;
-                  }
-              """)
-              im = apply_re.sub(new_apply, im, count=1)
-              ios_main.write_text(im)
-
-          # 4) Runtime profile: persisted switch, thermal relayout, 2-frame
-          # MTGS queue, and high-priority emulation thread.
-          sc = scene.read_text()
-          if '// ARMSX2_IOS16_A15_RUNTIME_V1' not in sc:
-              scene_anchor = '    UIWindowScene *windowScene = (UIWindowScene *)scene;\n'
-              if sc.count(scene_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: UIWindowScene anchor changed upstream.')
-              boot_profile = textwrap.dedent("""\
-                  // ARMSX2_IOS16_A15_RUNTIME_V1
-                  NSUserDefaults *armsx2PerfDefaults = [NSUserDefaults standardUserDefaults];
-                  const BOOL armsx2A15Performance =
-                      [armsx2PerfDefaults objectForKey:@"ARMSX2_A15PerformanceProfile"] ?
-                          [armsx2PerfDefaults boolForKey:@"ARMSX2_A15PerformanceProfile"] : YES;
-                  setenv("ARMSX2_A15_PERFORMANCE", armsx2A15Performance ? "1" : "0", 1);
-                  NSLog(@"[A15] iPhone 13 Pro Max performance profile: %@",
-                        armsx2A15Performance ? @"ON" : @"OFF");
-
-              """)
-              sc = sc.replace(scene_anchor, scene_anchor + boot_profile, 1)
-
-              view_line = '        g_gameRenderView.clipsToBounds = YES;\n'
-              if sc.count(view_line) != 1:
-                  raise SystemExit('A15 Perf V1: game render-view anchor changed upstream.')
-              observers = textwrap.dedent("""\
-                  // A15 profile: recalculate presentation scale when iOS heat or
-                  // Low Power Mode changes.
-                  [[NSNotificationCenter defaultCenter]
-                      addObserverForName:NSProcessInfoThermalStateDidChangeNotification
-                                  object:[NSProcessInfo processInfo]
-                                   queue:[NSOperationQueue mainQueue]
-                              usingBlock:^(NSNotification * _Nonnull note) {
-                                  if (g_gameRenderView)
-                                      [g_gameRenderView setNeedsLayout];
-                              }];
-                  [[NSNotificationCenter defaultCenter]
-                      addObserverForName:NSProcessInfoPowerStateDidChangeNotification
-                                  object:[NSProcessInfo processInfo]
-                                   queue:[NSOperationQueue mainQueue]
-                              usingBlock:^(NSNotification * _Nonnull note) {
-                                  if (g_gameRenderView)
-                                      [g_gameRenderView setNeedsLayout];
-                              }];
-              """)
-              sc = sc.replace(view_line, view_line + observers, 1)
-
-              startup_re = re.compile(
-                  r'(?m)^(?P<indent>[ \\t]*)VMManager::Internal::LoadStartupSettings\\(\\);
-              cpu_anchor = '        s_cpuThreadId = std::this_thread::get_id();\n'
-              if sc.count(cpu_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: persistent VM-thread anchor changed upstream.')
-              cpu_qos = (
-                  cpu_anchor +
-                  '        if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "            armsx2_perf && armsx2_perf[0] == '1')\n"
-                  '        {\n'
-                  '            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
-                  '        }\n'
-              )
-              sc = sc.replace(cpu_anchor, cpu_qos, 1)
-
-              if '#include <pthread/qos.h>' not in sc:
-                  include_anchor = '#include <thread>\n'
-                  if sc.count(include_anchor) != 1:
-                      raise SystemExit('A15 Perf V1: SceneDelegate thread include changed upstream.')
-                  sc = sc.replace(
+          if native_tag not in renderer:
+              if '#include <cstdlib>' not in renderer:
+                  include_anchor = '#include <bit>'
+                  if include_anchor not in renderer:
+                      raise SystemExit(
+                          'Low Memory V9.4: GSRendererHW standard include anchor changed upstream.'
+                      )
+                  renderer = renderer.replace(
                       include_anchor,
-                      include_anchor + '#include <pthread/qos.h>\n',
+                      include_anchor + '\n#include <cstdlib>',
                       1,
                   )
-              scene.write_text(sc)
 
-          # 5) GS/MTVU scheduling QoS.
-          gs = mtgs.read_text()
-          if '// ARMSX2_IOS16_A15_GS_QOS_V1' not in gs:
-              if '#include <cstdlib>' not in gs:
-                  gs = gs.replace('#include <list>\n', '#include <cstdlib>\n#include <list>\n', 1)
-              if '#include <pthread/qos.h>' not in gs:
-                  gs = gs.replace(
-                      '#include <vector>\n',
-                      '#include <vector>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
-                      1,
-                  )
-              gs_anchor = '\tThreading::SetNameOfCurrentThread("GS");\n'
-              if gs.count(gs_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: GS thread-name anchor changed upstream.')
-              gs_qos = (
-                  gs_anchor +
-                  '#if defined(__APPLE__)\n'
-                  '\t// ARMSX2_IOS16_A15_GS_QOS_V1\n'
-                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
-                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
-                  '#endif\n'
+              condition = (
+                  'if (g_texture_cache->GetHashCacheMemoryUsage() > '
+                  '1024 * 1024 * 1024)'
               )
-              gs = gs.replace(gs_anchor, gs_qos, 1)
-              mtgs.write_text(gs)
-
-          vu = mtvu.read_text()
-          if '// ARMSX2_IOS16_A15_MTVU_QOS_V1' not in vu:
-              if '#include <cstdlib>' not in vu:
-                  vu = vu.replace('#include <thread>\n', '#include <cstdlib>\n#include <thread>\n', 1)
-              if '#include <pthread/qos.h>' not in vu:
-                  vu = vu.replace(
-                      '#include <thread>\n',
-                      '#include <thread>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
-                      1,
+              if condition not in renderer:
+                  raise SystemExit(
+                      'Low Memory V9.4: stock 1 GB hash-cache overflow condition '
+                      'changed upstream; refusing a blind renderer patch.'
                   )
-              vu_anchor = '\tThreading::SetNameOfCurrentThread("MTVU");\n'
-              if vu.count(vu_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: MTVU thread-name anchor changed upstream.')
-              vu_qos = (
-                  vu_anchor +
-                  '#if defined(__APPLE__)\n'
-                  '\t// ARMSX2_IOS16_A15_MTVU_QOS_V1\n'
-                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
-                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);\n'
-                  '#endif\n'
-              )
-              vu = vu.replace(vu_anchor, vu_qos, 1)
-              mtvu.write_text(vu)
 
-          print('A15 Performance V1 patch applied successfully.')
-          print('Low Memory Mode: removed; stock renderer cache behavior retained.')
-          print('A15 target + LTO + adaptive presentation + QoS + queue tuning: enabled.')
+              replacement = '''// ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94
+          const char* armsx2_low_memory_env = std::getenv("ARMSX2_LOW_MEMORY_MODE");
+          const bool armsx2_low_memory_mode =
+              armsx2_low_memory_env && armsx2_low_memory_env[0] == '1';
+          const u64 armsx2_hash_cache_limit = armsx2_low_memory_mode ?
+              (384ULL * 1024ULL * 1024ULL) :
+              (1024ULL * 1024ULL * 1024ULL);
+
+          if (g_texture_cache->GetHashCacheMemoryUsage() > armsx2_hash_cache_limit)'''
+
+              renderer = renderer.replace(condition, replacement, 1)
+              renderer_path.write_text(renderer)
+
+          print('Low Memory Mode V9.4 patched successfully.')
+          print(f'  Runtime toggle: {swift_path}')
+          print(f'  Cold-launch persistence: {scene_path}')
+          print(f'  GS hash-cache limit: {renderer_path}')
           PY
 
-      - name: Verify iPhone 13 Pro Max A15 Performance V1
+      - name: Verify iPhone Low Memory Mode V9.4
         shell: bash
         run: |
           set -euo pipefail
 
-          grep -q 'ARMSX2_IOS16_A15_PERF_V1' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
-          grep -q 'add_compile_options("-mcpu=apple-a15")' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
-          if grep -q 'add_compile_options("-mcpu=apple-a12")' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake; then
-            echo 'ERROR: generic apple-a12 compiler target still active.' >&2
-            exit 1
-          fi
+          echo 'Low Memory Mode UI:'
+          grep -n -A70 -B8 'ARMSX2_IOS16_LOW_MEMORY_MODE_V94' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          echo
 
-          grep -q 'ARMSX2_IOS16_A15_PERF_UI_V1' \
-            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
-          grep -q 'ARMSX2_A15PerformanceProfile' \
-            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
+          echo 'Low Memory Mode renderer path:'
+          grep -n -A35 -B8 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          echo
 
-          grep -q 'ARMSX2_IOS16_A15_METAL_V1' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-          grep -q 'maximumDrawableCount' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-          grep -q 'NSProcessInfoThermalStateSerious' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-
-          grep -q 'ARMSX2_IOS16_A15_RUNTIME_V1' \
+          grep -q 'ARMSX2_LowMemoryMode' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
+          grep -q 'ARMSX2_LOW_MEMORY_MODE' \
             platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
-          grep -q 'EmuConfig.GS.VsyncQueueSize = 2;' \
-            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
-          grep -q 'QOS_CLASS_USER_INTERACTIVE' \
-            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q '384ULL \* 1024ULL \* 1024ULL' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q '1024ULL \* 1024ULL \* 1024ULL' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'g_texture_cache->RemoveAll(true, false, true);' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'g_gs_device->PurgePool();' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+          grep -q 'GSConfig.TexturePreloading = TexturePreloadingLevel::Partial;' \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp
 
-          grep -q 'ARMSX2_IOS16_A15_GS_QOS_V1' pcsx2/MTGS.cpp
-          grep -q 'QOS_CLASS_USER_INTERACTIVE' pcsx2/MTGS.cpp
-          grep -q 'ARMSX2_IOS16_A15_MTVU_QOS_V1' pcsx2/MTVU.cpp
-          grep -q 'QOS_CLASS_USER_INITIATED' pcsx2/MTVU.cpp
+          # Make sure V9.4 did not disturb the already validated controller branch.
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' \
+            pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_INLINE_V931' \
+            platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift
 
-          # LTO was already enabled in the device generator; keep it on.
-          grep -q -- '-DLTO_PCSX2_CORE=ON' \
-            platforms/ios/scripts/generate-ios-xcode.sh
+          python3 - <<'PY'
+          from pathlib import Path
 
-          # Regression guards for the field-tested custom features.
-          grep -q 'ARMSX2_IOS16_JUICED_NATIVE_V953' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' pcsx2/Input/SDLInputSource.cpp
-          if grep -q 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' pcsx2/GS/Renderers/HW/GSRendererHW.cpp; then
-            echo 'ERROR: Low Memory renderer patch should not be present in the A15 build.' >&2
-            exit 1
-          fi
+          renderer = Path('pcsx2/GS/Renderers/HW/GSRendererHW.cpp').read_text()
+          if 'GetHashCacheMemoryUsage() > 1024 * 1024 * 1024' in renderer:
+              raise SystemExit('Low Memory V9.4: old unconditional 1 GB condition remains.')
 
-          echo 'A15 target: OK'
-          echo 'PCSX2-core LTO: ON'
-          echo '2.0x thermally adaptive Metal presentation: OK'
-          echo '2-deep Metal drawable queue: OK'
-          echo '2-frame MTGS queue cap: OK'
-          echo 'CPU/GS/MTVU QoS tuning: OK'
-          echo 'Juiced / GT4 / analog tuning preserved: OK'
-          echo 'Low Memory Mode removed; stock renderer cache behavior: OK'
+          if renderer.count('ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94') != 1:
+              raise SystemExit('Low Memory V9.4: native marker count is not exactly one.')
+
+          swift = Path(
+              'platforms/ios/app/src/main/swift/Views/Settings/GamepadSettingsView.swift'
+          ).read_text()
+          if 'ARMSX2_IOS16_LOW_MEMORY_MODE_V94' not in swift:
+              raise SystemExit('Low Memory V9.4.1: Swift marker missing during verification.')
+
+          # V9.4 verifier bug fix: do not scan an arbitrary character window for
+          # NavigationLink. GamepadSettingsView already contains unrelated stock
+          # NavigationLinks, so that produced a false failure even though the
+          # Low Memory control itself is a Toggle. Verify the exact control shape
+          # instead.
+          required_ui = [
+              '@AppStorage("ARMSX2_LowMemoryMode")',
+              'private var lowMemoryMode = true',
+              'Toggle(isOn: Binding(',
+              'Text("Low Memory Mode")',
+              'Text("iPhone Memory")',
+              'armsx2SetLowMemoryEnvironment(enabled)',
+          ]
+          missing_ui = [needle for needle in required_ui if needle not in swift]
+          if missing_ui:
+              raise SystemExit(
+                  'Low Memory V9.4.1: expected Toggle UI wiring missing: ' +
+                  ', '.join(missing_ui)
+              )
+
+          print('384 MB Low Memory threshold: OK')
+          print('1 GB stock fallback when disabled: OK')
+          print('Existing PCSX2 purge path preserved: OK')
+          print('GT4 V9.2 + analog tuning V9.3.1 markers preserved: OK')
+          print('V9.4.1 verification passed.')
+          PY
 
       - name: Show remaining iOS 17 source markers
         shell: bash
@@ -2372,7 +2312,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.6.0-a15-performance
+          name: ARMSX2-iOS16-unsigned-v9.5.3-juiced-controls-low-memory
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2380,228 +2320,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.6.0-a15-performance
+          name: ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.0 A15-performance build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.0-a15-performance and inspect the first real error.' >&2
-          exit 1
-
-              )
-              startup_matches = list(startup_re.finditer(sc))
-              if len(startup_matches) != 2:
-                  raise SystemExit(
-                      f'A15 Perf V1: expected 2 startup-settings load points, '
-                      f'found {len(startup_matches)}.'
-                  )
-
-              def add_queue_cap(match):
-                  indent = match.group('indent')
-                  return (
-                      indent + 'VMManager::Internal::LoadStartupSettings();\\n' +
-                      indent + 'if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\\n' +
-                      indent + "    armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)\\n" +
-                      indent + '{\\n' +
-                      indent + '    Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);\\n' +
-                      indent + '    EmuConfig.GS.VsyncQueueSize = 2;\\n' +
-                      indent + '}'
-                  )
-
-              sc = startup_re.sub(add_queue_cap, sc)
-
-              cpu_anchor = '        s_cpuThreadId = std::this_thread::get_id();\n'
-              if sc.count(cpu_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: persistent VM-thread anchor changed upstream.')
-              cpu_qos = (
-                  cpu_anchor +
-                  '        if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "            armsx2_perf && armsx2_perf[0] == '1')\n"
-                  '        {\n'
-                  '            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
-                  '        }\n'
-              )
-              sc = sc.replace(cpu_anchor, cpu_qos, 1)
-
-              if '#include <pthread/qos.h>' not in sc:
-                  include_anchor = '#include <thread>\n'
-                  if sc.count(include_anchor) != 1:
-                      raise SystemExit('A15 Perf V1: SceneDelegate thread include changed upstream.')
-                  sc = sc.replace(
-                      include_anchor,
-                      include_anchor + '#include <pthread/qos.h>\n',
-                      1,
-                  )
-              scene.write_text(sc)
-
-          # 5) GS/MTVU scheduling QoS.
-          gs = mtgs.read_text()
-          if '// ARMSX2_IOS16_A15_GS_QOS_V1' not in gs:
-              if '#include <cstdlib>' not in gs:
-                  gs = gs.replace('#include <list>\n', '#include <cstdlib>\n#include <list>\n', 1)
-              if '#include <pthread/qos.h>' not in gs:
-                  gs = gs.replace(
-                      '#include <vector>\n',
-                      '#include <vector>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
-                      1,
-                  )
-              gs_anchor = '\tThreading::SetNameOfCurrentThread("GS");\n'
-              if gs.count(gs_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: GS thread-name anchor changed upstream.')
-              gs_qos = (
-                  gs_anchor +
-                  '#if defined(__APPLE__)\n'
-                  '\t// ARMSX2_IOS16_A15_GS_QOS_V1\n'
-                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
-                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
-                  '#endif\n'
-              )
-              gs = gs.replace(gs_anchor, gs_qos, 1)
-              mtgs.write_text(gs)
-
-          vu = mtvu.read_text()
-          if '// ARMSX2_IOS16_A15_MTVU_QOS_V1' not in vu:
-              if '#include <cstdlib>' not in vu:
-                  vu = vu.replace('#include <thread>\n', '#include <cstdlib>\n#include <thread>\n', 1)
-              if '#include <pthread/qos.h>' not in vu:
-                  vu = vu.replace(
-                      '#include <thread>\n',
-                      '#include <thread>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
-                      1,
-                  )
-              vu_anchor = '\tThreading::SetNameOfCurrentThread("MTVU");\n'
-              if vu.count(vu_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: MTVU thread-name anchor changed upstream.')
-              vu_qos = (
-                  vu_anchor +
-                  '#if defined(__APPLE__)\n'
-                  '\t// ARMSX2_IOS16_A15_MTVU_QOS_V1\n'
-                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
-                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);\n'
-                  '#endif\n'
-              )
-              vu = vu.replace(vu_anchor, vu_qos, 1)
-              mtvu.write_text(vu)
-
-          print('A15 Performance V1 patch applied successfully.')
-          print('Low Memory Mode: removed; stock renderer cache behavior retained.')
-          print('A15 target + LTO + adaptive presentation + QoS + queue tuning: enabled.')
-          PY
-
-      - name: Verify iPhone 13 Pro Max A15 Performance V1
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          grep -q 'ARMSX2_IOS16_A15_PERF_V1' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
-          grep -q 'add_compile_options("-mcpu=apple-a15")' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
-          if grep -q 'add_compile_options("-mcpu=apple-a12")' \
-            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake; then
-            echo 'ERROR: generic apple-a12 compiler target still active.' >&2
-            exit 1
-          fi
-
-          grep -q 'ARMSX2_IOS16_A15_PERF_UI_V1' \
-            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
-          grep -q 'ARMSX2_A15PerformanceProfile' \
-            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
-
-          grep -q 'ARMSX2_IOS16_A15_METAL_V1' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-          grep -q 'maximumDrawableCount' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-          grep -q 'NSProcessInfoThermalStateSerious' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
-
-          grep -q 'ARMSX2_IOS16_A15_RUNTIME_V1' \
-            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
-          grep -q 'EmuConfig.GS.VsyncQueueSize = 2;' \
-            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
-          grep -q 'QOS_CLASS_USER_INTERACTIVE' \
-            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
-
-          grep -q 'ARMSX2_IOS16_A15_GS_QOS_V1' pcsx2/MTGS.cpp
-          grep -q 'QOS_CLASS_USER_INTERACTIVE' pcsx2/MTGS.cpp
-          grep -q 'ARMSX2_IOS16_A15_MTVU_QOS_V1' pcsx2/MTVU.cpp
-          grep -q 'QOS_CLASS_USER_INITIATED' pcsx2/MTVU.cpp
-
-          # LTO was already enabled in the device generator; keep it on.
-          grep -q -- '-DLTO_PCSX2_CORE=ON' \
-            platforms/ios/scripts/generate-ios-xcode.sh
-
-          # Regression guards for the field-tested custom features.
-          grep -q 'ARMSX2_IOS16_JUICED_NATIVE_V953' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' pcsx2/Input/SDLInputSource.cpp
-          if grep -q 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' pcsx2/GS/Renderers/HW/GSRendererHW.cpp; then
-            echo 'ERROR: Low Memory renderer patch should not be present in the A15 build.' >&2
-            exit 1
-          fi
-
-          echo 'A15 target: OK'
-          echo 'PCSX2-core LTO: ON'
-          echo '2.0x thermally adaptive Metal presentation: OK'
-          echo '2-deep Metal drawable queue: OK'
-          echo '2-frame MTGS queue cap: OK'
-          echo 'CPU/GS/MTVU QoS tuning: OK'
-          echo 'Juiced / GT4 / analog tuning preserved: OK'
-          echo 'Low Memory Mode removed; stock renderer cache behavior: OK'
-
-      - name: Show remaining iOS 17 source markers
-        shell: bash
-        run: |
-          echo 'Remaining explicit Observation / iOS17 markers (diagnostic only):'
-          grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(|\.presentationCornerRadius\(' platforms/ios/app/src/main/swift || true
-
-      - name: Build unsigned iOS 16 IPA
-        id: build
-        continue-on-error: true
-        shell: bash
-        run: |
-          rm -rf platforms/ios/build-ios-xcode
-          ./platforms/ios/scripts/build-ios-ipa.sh
-
-      - name: Verify deployment target
-        if: steps.build.outcome == 'success'
-        shell: bash
-        run: |
-          APP='platforms/ios/build-ios-xcode/Release-iphoneos/ARMSX2iOS.app'
-          BIN="$APP/ARMSX2iOS"
-          echo 'Info.plist MinimumOSVersion:'
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
-          echo
-          echo 'Mach-O build version:'
-          xcrun vtool -show-build "$BIN"
-          echo
-          if ! xcrun vtool -show-build "$BIN" | grep -Eq 'minos[[:space:]]+16(\.0+)?'; then
-            echo 'ERROR: Mach-O executable does not report iOS 16.x as minos.' >&2
-            exit 1
-          fi
-
-      - name: Upload IPA
-        if: steps.build.outcome == 'success'
-        uses: actions/upload-artifact@v7
-        with:
-          name: ARMSX2-iOS16-unsigned-v9.6.0-a15-performance
-          path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
-          if-no-files-found: error
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ARMSX2-iOS16-build-log-v9.6.0-a15-performance
-          path: platforms/ios/build-ios-xcode/xcodebuild.log
-          if-no-files-found: ignore
-
-      - name: Fail if source build failed
-        if: steps.build.outcome == 'failure'
-        run: |
-          echo 'The iOS 16 V9.6.0 A15-performance build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.0-a15-performance and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.5.3 Juiced-controls low-memory build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.5.3-juiced-controls-low-memory and inspect the first real error.' >&2
           exit 1
