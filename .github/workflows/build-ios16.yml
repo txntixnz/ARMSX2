@@ -2364,7 +2364,7 @@ jobs:
                   Text(settings.localized("This changes presentation/scheduling only; PS2 internal rendering resolution and game timing stay unchanged. The build itself is compiled specifically for Apple A15."))
               }
 
-'''
+          '''
               ui = ui.replace(boot_anchor, perf_section + boot_anchor, 1)
               emulator_settings.write_text(ui)
 
@@ -2390,69 +2390,69 @@ jobs:
                   )
 
               old_scale = '''- (CGFloat)armsx2NativeContentScale {
-    UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
-    CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
-    return scale > 0.0 ? scale : 1.0;
-}
-'''
+          UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+          CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
+          return scale > 0.0 ? scale : 1.0;
+          }
+          '''
               if old_scale not in im:
                   raise SystemExit(
                       'A15 Perf V1: ARMSX2GameView native-scale method changed upstream.'
                   )
 
               new_scale = '''// ARMSX2_IOS16_A15_METAL_V1
-- (BOOL)armsx2A15PerformanceProfileEnabled {
-    const char* value = std::getenv("ARMSX2_A15_PERFORMANCE");
-    return value && value[0] == '1';
-}
-- (CGFloat)armsx2NativeContentScale {
-    UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
-    CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
-    if (scale <= 0.0)
-        scale = 1.0;
+          - (BOOL)armsx2A15PerformanceProfileEnabled {
+          const char* value = std::getenv("ARMSX2_A15_PERFORMANCE");
+          return value && value[0] == '1';
+          }
+          - (CGFloat)armsx2NativeContentScale {
+          UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
+          CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
+          if (scale <= 0.0)
+          scale = 1.0;
 
-    if (![self armsx2A15PerformanceProfileEnabled])
-        return scale;
+          if (![self armsx2A15PerformanceProfileEnabled])
+          return scale;
 
-    CGFloat cap = 2.0;
-    const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
-    if (thermal >= NSProcessInfoThermalStateCritical)
-        cap = 1.5;
-    else if (thermal >= NSProcessInfoThermalStateSerious ||
+          CGFloat cap = 2.0;
+          const NSProcessInfoThermalState thermal = NSProcessInfo.processInfo.thermalState;
+          if (thermal >= NSProcessInfoThermalStateCritical)
+          cap = 1.5;
+          else if (thermal >= NSProcessInfoThermalStateSerious ||
              NSProcessInfo.processInfo.lowPowerModeEnabled)
-        cap = 1.75;
+          cap = 1.75;
 
-    return MIN(scale, cap);
-}
-'''
+          return MIN(scale, cap);
+          }
+          '''
               im = im.replace(old_scale, new_scale, 1)
 
               old_apply = '''- (void)armsx2ApplyNativeContentScale {
-    const CGFloat scale = [self armsx2NativeContentScale];
-    self.contentScaleFactor = scale;
-    self.layer.contentsScale = scale;
-    ((CAMetalLayer*)self.layer).contentsScale = scale;
-}
-'''
+          const CGFloat scale = [self armsx2NativeContentScale];
+          self.contentScaleFactor = scale;
+          self.layer.contentsScale = scale;
+          ((CAMetalLayer*)self.layer).contentsScale = scale;
+          }
+          '''
               if old_apply not in im:
                   raise SystemExit(
                       'A15 Perf V1: ARMSX2GameView apply-scale method changed upstream.'
                   )
 
               new_apply = '''- (void)armsx2ApplyNativeContentScale {
-    const CGFloat scale = [self armsx2NativeContentScale];
-    self.contentScaleFactor = scale;
-    self.layer.contentsScale = scale;
+          const CGFloat scale = [self armsx2NativeContentScale];
+          self.contentScaleFactor = scale;
+          self.layer.contentsScale = scale;
 
-    CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
-    metalLayer.contentsScale = scale;
-    metalLayer.presentsWithTransaction = NO;
-    // Two drawables reduces queued presentation work/input latency on the
-    // device profile. Restore the ordinary three-deep path when disabled.
-    metalLayer.maximumDrawableCount =
-        [self armsx2A15PerformanceProfileEnabled] ? 2 : 3;
-}
-'''
+          CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+          metalLayer.contentsScale = scale;
+          metalLayer.presentsWithTransaction = NO;
+          // Two drawables reduces queued presentation work/input latency on the
+          // device profile. Restore the ordinary three-deep path when disabled.
+          metalLayer.maximumDrawableCount =
+          [self armsx2A15PerformanceProfileEnabled] ? 2 : 3;
+          }
+          '''
               im = im.replace(old_apply, new_apply, 1)
               ios_main.write_text(im)
 
@@ -2480,32 +2480,32 @@ jobs:
                       'A15 Perf V1: UIWindowScene anchor changed upstream.'
                   )
               boot_profile = '''    // ARMSX2_IOS16_A15_RUNTIME_V1
-    NSUserDefaults *armsx2PerfDefaults = [NSUserDefaults standardUserDefaults];
-    const BOOL armsx2A15Performance =
-        [armsx2PerfDefaults objectForKey:@"ARMSX2_A15PerformanceProfile"] ?
+          NSUserDefaults *armsx2PerfDefaults = [NSUserDefaults standardUserDefaults];
+          const BOOL armsx2A15Performance =
+          [armsx2PerfDefaults objectForKey:@"ARMSX2_A15PerformanceProfile"] ?
             [armsx2PerfDefaults boolForKey:@"ARMSX2_A15PerformanceProfile"] : YES;
-    setenv("ARMSX2_A15_PERFORMANCE", armsx2A15Performance ? "1" : "0", 1);
-    NSLog(@"[A15] iPhone 13 Pro Max performance profile: %@",
+          setenv("ARMSX2_A15_PERFORMANCE", armsx2A15Performance ? "1" : "0", 1);
+          NSLog(@"[A15] iPhone 13 Pro Max performance profile: %@",
           armsx2A15Performance ? @"ON" : @"OFF");
 
-'''
+          '''
               sc = sc.replace(scene_anchor, scene_anchor + boot_profile, 1)
 
               view_anchor = '''        g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
-        g_gameRenderView.backgroundColor = [UIColor blackColor];
-        g_gameRenderView.clipsToBounds = YES;
-'''
+          g_gameRenderView.backgroundColor = [UIColor blackColor];
+          g_gameRenderView.clipsToBounds = YES;
+          '''
               if view_anchor not in sc:
                   raise SystemExit(
                       'A15 Perf V1: game render view creation anchor changed upstream.'
                   )
               view_extra = '''        g_gameRenderView = [[ARMSX2GameView alloc] initWithFrame:CGRectZero];
-        g_gameRenderView.backgroundColor = [UIColor blackColor];
-        g_gameRenderView.clipsToBounds = YES;
+          g_gameRenderView.backgroundColor = [UIColor blackColor];
+          g_gameRenderView.clipsToBounds = YES;
 
-        // Re-evaluate the presentation cap immediately when iOS changes
-        // thermal or Low Power state. The observer lives for the app scene.
-        [[NSNotificationCenter defaultCenter]
+          // Re-evaluate the presentation cap immediately when iOS changes
+          // thermal or Low Power state. The observer lives for the app scene.
+          [[NSNotificationCenter defaultCenter]
             addObserverForName:NSProcessInfoThermalStateDidChangeNotification
                         object:[NSProcessInfo processInfo]
                          queue:[NSOperationQueue mainQueue]
@@ -2513,7 +2513,7 @@ jobs:
                         if (g_gameRenderView)
                             [g_gameRenderView setNeedsLayout];
                     }];
-        [[NSNotificationCenter defaultCenter]
+          [[NSNotificationCenter defaultCenter]
             addObserverForName:NSProcessInfoPowerStateDidChangeNotification
                         object:[NSProcessInfo processInfo]
                          queue:[NSOperationQueue mainQueue]
@@ -2521,7 +2521,7 @@ jobs:
                         if (g_gameRenderView)
                             [g_gameRenderView setNeedsLayout];
                     }];
-'''
+          '''
               sc = sc.replace(view_anchor, view_extra, 1)
 
               startup_anchor = '    VMManager::Internal::LoadStartupSettings();\n'
@@ -2530,36 +2530,36 @@ jobs:
                       'A15 Perf V1: startup-settings anchor changed upstream.'
                   )
               queue_patch = '''    VMManager::Internal::LoadStartupSettings();
-    if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
-        armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)
-    {
-        Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);
-        EmuConfig.GS.VsyncQueueSize = 2;
-    }
-'''
+          if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+          armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)
+          {
+          Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);
+          EmuConfig.GS.VsyncQueueSize = 2;
+          }
+          '''
               sc = sc.replace(startup_anchor, queue_patch, 1)
 
               vm_anchor = '''    std::thread vmThread([]() {
-        // === ONE-TIME INIT (runs once per app lifetime) ===
-        s_cpuThreadId = std::this_thread::get_id();
-'''
+          // === ONE-TIME INIT (runs once per app lifetime) ===
+          s_cpuThreadId = std::this_thread::get_id();
+          '''
               if vm_anchor not in sc:
                   raise SystemExit(
                       'A15 Perf V1: persistent VM-thread anchor changed upstream.'
                   )
               vm_qos = '''    std::thread vmThread([]() {
-        // === ONE-TIME INIT (runs once per app lifetime) ===
-        s_cpuThreadId = std::this_thread::get_id();
-        if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+          // === ONE-TIME INIT (runs once per app lifetime) ===
+          s_cpuThreadId = std::this_thread::get_id();
+          if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
             armsx2_perf && armsx2_perf[0] == '1')
-        {
+          {
             const int qos_result =
                 pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             std::fprintf(stderr, "@@A15_QOS@@ thread=CPU class=user_interactive result=%d\\n",
                          qos_result);
             std::fflush(stderr);
-        }
-'''
+          }
+          '''
               sc = sc.replace(vm_anchor, vm_qos, 1)
               scene.write_text(sc)
 
@@ -2580,25 +2580,25 @@ jobs:
                       1,
                   )
               gs_anchor = '''void MTGS::ThreadEntryPoint()
-{
-\tThreading::SetNameOfCurrentThread("GS");
-'''
+          {
+          \tThreading::SetNameOfCurrentThread("GS");
+          '''
               if gs_anchor not in gs:
                   raise SystemExit(
                       'A15 Perf V1: MTGS ThreadEntryPoint anchor changed upstream.'
                   )
               gs_patch = '''void MTGS::ThreadEntryPoint()
-{
-\tThreading::SetNameOfCurrentThread("GS");
-#if defined(__APPLE__)
-\t// ARMSX2_IOS16_A15_GS_QOS_V1
-\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
-\t\tarmsx2_perf && armsx2_perf[0] == '1')
-\t{
-\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-\t}
-#endif
-'''
+          {
+          \tThreading::SetNameOfCurrentThread("GS");
+          #if defined(__APPLE__)
+          \t// ARMSX2_IOS16_A15_GS_QOS_V1
+          \tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+          \t\tarmsx2_perf && armsx2_perf[0] == '1')
+          \t{
+          \t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+          \t}
+          #endif
+          '''
               gs = gs.replace(gs_anchor, gs_patch, 1)
               mtgs.write_text(gs)
 
@@ -2613,25 +2613,25 @@ jobs:
                       1,
                   )
               vu_anchor = '''void VU_Thread::ExecuteRingBuffer()
-{
-\tThreading::SetNameOfCurrentThread("MTVU");
-'''
+          {
+          \tThreading::SetNameOfCurrentThread("MTVU");
+          '''
               if vu_anchor not in vu:
                   raise SystemExit(
                       'A15 Perf V1: MTVU ExecuteRingBuffer anchor changed upstream.'
                   )
               vu_patch = '''void VU_Thread::ExecuteRingBuffer()
-{
-\tThreading::SetNameOfCurrentThread("MTVU");
-#if defined(__APPLE__)
-\t// ARMSX2_IOS16_A15_MTVU_QOS_V1
-\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
-\t\tarmsx2_perf && armsx2_perf[0] == '1')
-\t{
-\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
-\t}
-#endif
-'''
+          {
+          \tThreading::SetNameOfCurrentThread("MTVU");
+          #if defined(__APPLE__)
+          \t// ARMSX2_IOS16_A15_MTVU_QOS_V1
+          \tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");
+          \t\tarmsx2_perf && armsx2_perf[0] == '1')
+          \t{
+          \t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+          \t}
+          #endif
+          '''
               vu = vu.replace(vu_anchor, vu_patch, 1)
               mtvu.write_text(vu)
 
