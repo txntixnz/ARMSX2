@@ -2194,19 +2194,223 @@ jobs:
               """)
               sc = sc.replace(view_line, view_line + observers, 1)
 
-              startup_anchor = '    VMManager::Internal::LoadStartupSettings();\n'
-              if sc.count(startup_anchor) != 1:
-                  raise SystemExit('A15 Perf V1: startup-settings anchor changed upstream.')
-              queue_patch = (
-                  startup_anchor +
-                  '    if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
-                  "        armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)\n"
-                  '    {\n'
-                  '        Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);\n'
-                  '        EmuConfig.GS.VsyncQueueSize = 2;\n'
-                  '    }\n'
+              startup_re = re.compile(
+                  r'(?m)^(?P<indent>[ \\t]*)VMManager::Internal::LoadStartupSettings\\(\\);
+              cpu_anchor = '        s_cpuThreadId = std::this_thread::get_id();\n'
+              if sc.count(cpu_anchor) != 1:
+                  raise SystemExit('A15 Perf V1: persistent VM-thread anchor changed upstream.')
+              cpu_qos = (
+                  cpu_anchor +
+                  '        if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
+                  "            armsx2_perf && armsx2_perf[0] == '1')\n"
+                  '        {\n'
+                  '            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
+                  '        }\n'
               )
-              sc = sc.replace(startup_anchor, queue_patch, 1)
+              sc = sc.replace(cpu_anchor, cpu_qos, 1)
+
+              if '#include <pthread/qos.h>' not in sc:
+                  include_anchor = '#include <thread>\n'
+                  if sc.count(include_anchor) != 1:
+                      raise SystemExit('A15 Perf V1: SceneDelegate thread include changed upstream.')
+                  sc = sc.replace(
+                      include_anchor,
+                      include_anchor + '#include <pthread/qos.h>\n',
+                      1,
+                  )
+              scene.write_text(sc)
+
+          # 5) GS/MTVU scheduling QoS.
+          gs = mtgs.read_text()
+          if '// ARMSX2_IOS16_A15_GS_QOS_V1' not in gs:
+              if '#include <cstdlib>' not in gs:
+                  gs = gs.replace('#include <list>\n', '#include <cstdlib>\n#include <list>\n', 1)
+              if '#include <pthread/qos.h>' not in gs:
+                  gs = gs.replace(
+                      '#include <vector>\n',
+                      '#include <vector>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
+                      1,
+                  )
+              gs_anchor = '\tThreading::SetNameOfCurrentThread("GS");\n'
+              if gs.count(gs_anchor) != 1:
+                  raise SystemExit('A15 Perf V1: GS thread-name anchor changed upstream.')
+              gs_qos = (
+                  gs_anchor +
+                  '#if defined(__APPLE__)\n'
+                  '\t// ARMSX2_IOS16_A15_GS_QOS_V1\n'
+                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
+                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
+                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);\n'
+                  '#endif\n'
+              )
+              gs = gs.replace(gs_anchor, gs_qos, 1)
+              mtgs.write_text(gs)
+
+          vu = mtvu.read_text()
+          if '// ARMSX2_IOS16_A15_MTVU_QOS_V1' not in vu:
+              if '#include <cstdlib>' not in vu:
+                  vu = vu.replace('#include <thread>\n', '#include <cstdlib>\n#include <thread>\n', 1)
+              if '#include <pthread/qos.h>' not in vu:
+                  vu = vu.replace(
+                      '#include <thread>\n',
+                      '#include <thread>\n#if defined(__APPLE__)\n#include <pthread/qos.h>\n#endif\n',
+                      1,
+                  )
+              vu_anchor = '\tThreading::SetNameOfCurrentThread("MTVU");\n'
+              if vu.count(vu_anchor) != 1:
+                  raise SystemExit('A15 Perf V1: MTVU thread-name anchor changed upstream.')
+              vu_qos = (
+                  vu_anchor +
+                  '#if defined(__APPLE__)\n'
+                  '\t// ARMSX2_IOS16_A15_MTVU_QOS_V1\n'
+                  '\tif (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\n'
+                  "\t\tarmsx2_perf && armsx2_perf[0] == '1')\n"
+                  '\t\tpthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);\n'
+                  '#endif\n'
+              )
+              vu = vu.replace(vu_anchor, vu_qos, 1)
+              mtvu.write_text(vu)
+
+          print('A15 Performance V1 patch applied successfully.')
+          print('Low Memory Mode: removed; stock renderer cache behavior retained.')
+          print('A15 target + LTO + adaptive presentation + QoS + queue tuning: enabled.')
+          PY
+
+      - name: Verify iPhone 13 Pro Max A15 Performance V1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q 'ARMSX2_IOS16_A15_PERF_V1' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
+          grep -q 'add_compile_options("-mcpu=apple-a15")' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake
+          if grep -q 'add_compile_options("-mcpu=apple-a12")' \
+            platforms/ios/app/src/main/cpp/cmake/BuildParameters.cmake; then
+            echo 'ERROR: generic apple-a12 compiler target still active.' >&2
+            exit 1
+          fi
+
+          grep -q 'ARMSX2_IOS16_A15_PERF_UI_V1' \
+            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
+          grep -q 'ARMSX2_A15PerformanceProfile' \
+            platforms/ios/app/src/main/swift/Views/Settings/EmulatorSettingsView.swift
+
+          grep -q 'ARMSX2_IOS16_A15_METAL_V1' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+          grep -q 'maximumDrawableCount' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+          grep -q 'NSProcessInfoThermalStateSerious' \
+            platforms/ios/app/src/main/cpp/ios_main.mm
+
+          grep -q 'ARMSX2_IOS16_A15_RUNTIME_V1' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q 'EmuConfig.GS.VsyncQueueSize = 2;' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+          grep -q 'QOS_CLASS_USER_INTERACTIVE' \
+            platforms/ios/app/src/main/cpp/IOS/SceneDelegate.mm
+
+          grep -q 'ARMSX2_IOS16_A15_GS_QOS_V1' pcsx2/MTGS.cpp
+          grep -q 'QOS_CLASS_USER_INTERACTIVE' pcsx2/MTGS.cpp
+          grep -q 'ARMSX2_IOS16_A15_MTVU_QOS_V1' pcsx2/MTVU.cpp
+          grep -q 'QOS_CLASS_USER_INITIATED' pcsx2/MTVU.cpp
+
+          # LTO was already enabled in the device generator; keep it on.
+          grep -q -- '-DLTO_PCSX2_CORE=ON' \
+            platforms/ios/scripts/generate-ios-xcode.sh
+
+          # Regression guards for the field-tested custom features.
+          grep -q 'ARMSX2_IOS16_JUICED_NATIVE_V953' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'ARMSX2_IOS16_ANALOG_TUNING_NATIVE_V931' pcsx2/Input/SDLInputSource.cpp
+          if grep -q 'ARMSX2_IOS16_LOW_MEMORY_NATIVE_V94' pcsx2/GS/Renderers/HW/GSRendererHW.cpp; then
+            echo 'ERROR: Low Memory renderer patch should not be present in the A15 build.' >&2
+            exit 1
+          fi
+
+          echo 'A15 target: OK'
+          echo 'PCSX2-core LTO: ON'
+          echo '2.0x thermally adaptive Metal presentation: OK'
+          echo '2-deep Metal drawable queue: OK'
+          echo '2-frame MTGS queue cap: OK'
+          echo 'CPU/GS/MTVU QoS tuning: OK'
+          echo 'Juiced / GT4 / analog tuning preserved: OK'
+          echo 'Low Memory Mode removed; stock renderer cache behavior: OK'
+
+      - name: Show remaining iOS 17 source markers
+        shell: bash
+        run: |
+          echo 'Remaining explicit Observation / iOS17 markers (diagnostic only):'
+          grep -RInE '@Observable|@ObservationIgnored|@Bindable|MagnifyGesture\(|ContentUnavailableView\(|\.symbolEffect\(|\.contentMargins\(|\.scrollBounceBehavior\(|\.presentationCornerRadius\(' platforms/ios/app/src/main/swift || true
+
+      - name: Build unsigned iOS 16 IPA
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          rm -rf platforms/ios/build-ios-xcode
+          ./platforms/ios/scripts/build-ios-ipa.sh
+
+      - name: Verify deployment target
+        if: steps.build.outcome == 'success'
+        shell: bash
+        run: |
+          APP='platforms/ios/build-ios-xcode/Release-iphoneos/ARMSX2iOS.app'
+          BIN="$APP/ARMSX2iOS"
+          echo 'Info.plist MinimumOSVersion:'
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
+          echo
+          echo 'Mach-O build version:'
+          xcrun vtool -show-build "$BIN"
+          echo
+          if ! xcrun vtool -show-build "$BIN" | grep -Eq 'minos[[:space:]]+16(\.0+)?'; then
+            echo 'ERROR: Mach-O executable does not report iOS 16.x as minos.' >&2
+            exit 1
+          fi
+
+      - name: Upload IPA
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX2-iOS16-unsigned-v9.6.0-a15-performance
+          path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ARMSX2-iOS16-build-log-v9.6.0-a15-performance
+          path: platforms/ios/build-ios-xcode/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Fail if source build failed
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo 'The iOS 16 V9.6.0 A15-performance build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.0-a15-performance and inspect the first real error.' >&2
+          exit 1
+
+              )
+              startup_matches = list(startup_re.finditer(sc))
+              if len(startup_matches) != 2:
+                  raise SystemExit(
+                      f'A15 Perf V1: expected 2 startup-settings load points, '
+                      f'found {len(startup_matches)}.'
+                  )
+
+              def add_queue_cap(match):
+                  indent = match.group('indent')
+                  return (
+                      indent + 'VMManager::Internal::LoadStartupSettings();\\n' +
+                      indent + 'if (const char* armsx2_perf = std::getenv("ARMSX2_A15_PERFORMANCE");\\n' +
+                      indent + "    armsx2_perf && armsx2_perf[0] == '1' && EmuConfig.GS.VsyncQueueSize > 2)\\n" +
+                      indent + '{\\n' +
+                      indent + '    Console.WriteLn("[A15] MTGS VSync queue: %d -> 2", EmuConfig.GS.VsyncQueueSize);\\n' +
+                      indent + '    EmuConfig.GS.VsyncQueueSize = 2;\\n' +
+                      indent + '}'
+                  )
+
+              sc = startup_re.sub(add_queue_cap, sc)
 
               cpu_anchor = '        s_cpuThreadId = std::this_thread::get_id();\n'
               if sc.count(cpu_anchor) != 1:
