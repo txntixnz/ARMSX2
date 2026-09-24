@@ -10,6 +10,7 @@ struct GraphicsSettingsView: View {
     @State private var showShaderCacheClearConfirm = false
     @State private var shaderCacheResult: String?
     @State private var showShaderCacheResult = false
+    @AppStorage("ARMSX2_MetalPresentation2x") private var metalPresentation2x = true
 
     // Returning to the menu only pauses the VM, so a game can still be loaded
     // while this screen is open. Switching renderer then sends the next settings
@@ -98,6 +99,11 @@ struct GraphicsSettingsView: View {
     var body: some View {
         Form {
             Section {
+                Toggle(settings.localized("2× Metal Presentation Scale"), isOn: $metalPresentation2x)
+                Text(settings.localized("Caps the final iOS Metal presentation surface at 2× instead of the display's native scale. PS2 internal rendering resolution is unchanged. Fully close and relaunch ARMSX2 after changing this option."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [
                     ("Disabled (Default)", 0),
                     ("Inline Records (Debug)", 1),
