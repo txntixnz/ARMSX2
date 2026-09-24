@@ -43,7 +43,8 @@ if "ARMSX2_IOS16_A15_TARGET_V961" not in bp:
 # ---------------------------------------------------------------------------
 # 2) Graphics UI switches.
 #    - 2x presentation surface: validated performance win.
-#    - 2x presentation surface only; stock drawable queue retained.
+#    - 1.75x efficiency cap: optional experiment, default OFF.
+#    - Stock CAMetalLayer drawable queue retained.
 # ---------------------------------------------------------------------------
 gfx = graphics.read_text()
 
@@ -59,6 +60,8 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
         + "    // ARMSX2_IOS16_A15_METAL_UI_V961\n"
         + '    @AppStorage("ARMSX2_MetalPresentation2x") '
           "private var metalPresentation2x = true\n"
+        + '    @AppStorage("ARMSX2_MetalPresentation175x") '
+          "private var metalPresentation175x = false\n"
     )
     gfx = gfx.replace(state_anchor, state_block, 1)
 
@@ -73,6 +76,11 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
     perf_block = '''            Section {
                 Toggle(settings.localized("2× Metal Presentation Scale"), isOn: $metalPresentation2x)
                 Text(settings.localized("Caps only the final iOS Metal presentation surface at 2× instead of the display's native scale. PS2 internal rendering resolution is unchanged. Fully close and relaunch ARMSX2 after changing this option."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle(settings.localized("1.75× Metal Efficiency Scale"), isOn: $metalPresentation175x)
+                Text(settings.localized("Experimental. When enabled, caps the final Metal presentation surface at 1.75× for extra GPU headroom and lower power draw. This overrides the 2× cap but does not change PS2 internal resolution. Fully close and relaunch ARMSX2 after changing it."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -106,9 +114,18 @@ if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
                 scale = 1.0;
 
             NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+            const BOOL use175xPresentation =
+                [defaults boolForKey:@"ARMSX2_MetalPresentation175x"];
+
             id storedValue = [defaults objectForKey:@"ARMSX2_MetalPresentation2x"];
             const BOOL use2xPresentation = storedValue ? [storedValue boolValue] : YES;
-            if (use2xPresentation)
+
+            // 1.75x is an optional efficiency experiment and deliberately
+            // overrides the validated 2x cap when enabled. Turning it back off
+            // returns to the exact field-proven 2x behavior.
+            if (use175xPresentation)
+                scale = MIN(scale, (CGFloat)1.75);
+            else if (use2xPresentation)
                 scale = MIN(scale, (CGFloat)2.0);
 
             return scale;
@@ -137,8 +154,9 @@ if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
     im = apply_re.sub(apply_method, im, count=1)
     ios_main.write_text(im)
 
-print("A15/Metal V9.6.1 patch applied successfully.")
+print("A15/Metal V9.6.3 patch applied successfully.")
 print("  CPU target: apple-a15")
 print("  2x presentation scale: switchable, default ON")
+print("  1.75x efficiency scale: switchable, default OFF")
 print("  CAMetalLayer drawable queue: stock behavior retained")
 print("  PS2 internal rendering resolution: unchanged")
