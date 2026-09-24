@@ -43,7 +43,7 @@ if "ARMSX2_IOS16_A15_TARGET_V961" not in bp:
 # ---------------------------------------------------------------------------
 # 2) Graphics UI switches.
 #    - 2x presentation surface: validated performance win.
-#    - 2-frame drawable queue: next isolated latency/presentation experiment.
+#    - 2x presentation surface only; stock drawable queue retained.
 # ---------------------------------------------------------------------------
 gfx = graphics.read_text()
 
@@ -59,8 +59,6 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
         + "    // ARMSX2_IOS16_A15_METAL_UI_V961\n"
         + '    @AppStorage("ARMSX2_MetalPresentation2x") '
           "private var metalPresentation2x = true\n"
-        + '    @AppStorage("ARMSX2_MetalDrawableQueue2") '
-          "private var metalDrawableQueue2 = true\n"
     )
     gfx = gfx.replace(state_anchor, state_block, 1)
 
@@ -78,18 +76,13 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Toggle(settings.localized("2-Frame Metal Drawable Queue"), isOn: $metalDrawableQueue2)
-                Text(settings.localized("Uses two CAMetalLayer drawables instead of three to reduce final presentation queue depth and input-to-display latency. If a game becomes less smooth, turn this OFF and relaunch ARMSX2."))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
                 intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [
 '''
     gfx = gfx.replace(perf_anchor, perf_block, 1)
     graphics.write_text(gfx)
 
 # ---------------------------------------------------------------------------
-# 3) Final iOS presentation surface + CAMetalLayer queue.
+# 3) Final iOS presentation surface only. Keep stock CAMetalLayer queue.
 # ---------------------------------------------------------------------------
 im = ios_main.read_text()
 
@@ -138,15 +131,7 @@ if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
             const CGFloat scale = [self armsx2NativeContentScale];
             self.contentScaleFactor = scale;
             self.layer.contentsScale = scale;
-
-            CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
-            metalLayer.contentsScale = scale;
-
-            NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-            id queueStoredValue = [defaults objectForKey:@"ARMSX2_MetalDrawableQueue2"];
-            const BOOL use2DrawableQueue =
-                queueStoredValue ? [queueStoredValue boolValue] : YES;
-            metalLayer.maximumDrawableCount = use2DrawableQueue ? 2 : 3;
+            ((CAMetalLayer*)self.layer).contentsScale = scale;
         }
     """)
     im = apply_re.sub(apply_method, im, count=1)
@@ -155,5 +140,5 @@ if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
 print("A15/Metal V9.6.1 patch applied successfully.")
 print("  CPU target: apple-a15")
 print("  2x presentation scale: switchable, default ON")
-print("  2-frame CAMetalLayer drawable queue: switchable, default ON")
+print("  CAMetalLayer drawable queue: stock behavior retained")
 print("  PS2 internal rendering resolution: unchanged")
