@@ -2002,6 +2002,135 @@ jobs:
           print('Juiced V9.5.3 verification passed.')
           PY
 
+      - name: Add Juiced exclusive held-state routing V9.5.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          sdl_path = Path('pcsx2/Input/SDLInputSource.cpp')
+          if not sdl_path.is_file():
+              raise SystemExit('Juiced V9.5.4: SDLInputSource.cpp is missing.')
+
+          sdl = sdl_path.read_text()
+          if '// ARMSX2_IOS16_JUICED_NATIVE_V953' not in sdl:
+              raise SystemExit('Juiced V9.5.4: V9.5.3 remap is missing.')
+          if '// ARMSX2_IOS16_GT4_TRIGGER_PEDALS_HELD_POLL_V92' not in sdl:
+              raise SystemExit('Juiced V9.5.4: GT4 held-poll path is missing.')
+
+          marker = '// ARMSX2_IOS16_JUICED_EXCLUSIVE_V954'
+          if marker not in sdl:
+              poll_sig = 'void SDLInputSource::PollEvents()'
+              poll_pos = sdl.find(poll_sig)
+              if poll_pos < 0:
+                  raise SystemExit('Juiced V9.5.4: PollEvents() not found.')
+
+              # PollEvents is earlier in the file than the V9.5.3 helper
+              # definitions, so add forward declarations immediately before it.
+              forward = '''// ARMSX2_IOS16_JUICED_EXCLUSIVE_V954
+          static bool ARMSX2JuicedControlsEnabled();
+          static bool ARMSX2JuicedSetPS2Button(
+              u32 pad_index, GenericInputBinding target, float value);
+
+          '''
+              sdl = sdl[:poll_pos] + forward + sdl[poll_pos:]
+              poll_pos = sdl.find(poll_sig, poll_pos + len(forward))
+
+              # Find the matching closing brace of PollEvents(). This avoids
+              # relying on whitespace or the exact GT4 V9.2 function body.
+              open_pos = sdl.find('{', poll_pos)
+              if open_pos < 0:
+                  raise SystemExit('Juiced V9.5.4: PollEvents() opening brace not found.')
+
+              depth = 0
+              close_pos = -1
+              for i in range(open_pos, len(sdl)):
+                  ch = sdl[i]
+                  if ch == '{':
+                      depth += 1
+                  elif ch == '}':
+                      depth -= 1
+                      if depth == 0:
+                          close_pos = i
+                          break
+
+              if close_pos < 0:
+                  raise SystemExit('Juiced V9.5.4: PollEvents() closing brace not found.')
+
+              reconcile = '''
+              // Juiced V9.5.4: make the remap exclusive, not additive.
+              //
+              // V9.5.3 consumed the SDL gamepad edge event, but the iOS pad
+              // stack can still refresh the ordinary PS2 shoulder state from
+              // the physical controller. Reassert the complete Juiced mapping
+              // after all SDL events every poll so the original actions cannot
+              // leak through.
+              //
+              // Physical -> emulated PS2:
+              //   R1     -> R2 (shift up)
+              //   L1     -> L2 (shift down)
+              //   Square -> R1 (nitrous)
+              //   Cross  -> L1 (rear view)
+              if (ARMSX2JuicedControlsEnabled())
+              {
+                  for (const ControllerData& cd : m_controllers)
+                  {
+                      if (!cd.gamepad || cd.player_id < 0 ||
+                          cd.player_id >= static_cast<int>(Pad::NUM_CONTROLLER_PORTS))
+                      {
+                          continue;
+                      }
+
+                      const float physical_r1 =
+                          SDL_GetGamepadButton(cd.gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) ? 1.0f : 0.0f;
+                      const float physical_l1 =
+                          SDL_GetGamepadButton(cd.gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) ? 1.0f : 0.0f;
+                      const float physical_square =
+                          SDL_GetGamepadButton(cd.gamepad, SDL_GAMEPAD_BUTTON_WEST) ? 1.0f : 0.0f;
+                      const float physical_cross =
+                          SDL_GetGamepadButton(cd.gamepad, SDL_GAMEPAD_BUTTON_SOUTH) ? 1.0f : 0.0f;
+
+                      const u32 pad_index = static_cast<u32>(cd.player_id);
+
+                      // Desired Juiced outputs.
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::R2, physical_r1);
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::L2, physical_l1);
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::R1, physical_square);
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::L1, physical_cross);
+
+                      // The face buttons themselves are replaced in Juiced mode.
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::Square, 0.0f);
+                      ARMSX2JuicedSetPS2Button(
+                          pad_index, GenericInputBinding::Cross, 0.0f);
+                  }
+              }
+          '''
+
+              sdl = sdl[:close_pos] + reconcile + sdl[close_pos:]
+              sdl_path.write_text(sdl)
+
+          print('Juiced V9.5.4 exclusive held-state routing patched successfully.')
+          PY
+
+      - name: Verify Juiced exclusive held-state routing V9.5.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'ARMSX2_IOS16_JUICED_EXCLUSIVE_V954' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::R2, physical_r1' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::L2, physical_l1' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::R1, physical_square' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::L1, physical_cross' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::Square, 0.0f' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::Cross, 0.0f' pcsx2/Input/SDLInputSource.cpp
+          echo 'Juiced exclusive routing V9.5.4: OK'
+
       - name: Add iPhone Low Memory Mode V9.4
         shell: bash
         run: |
