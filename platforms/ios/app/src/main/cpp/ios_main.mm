@@ -303,18 +303,7 @@ void ARMSX2ConfigureImGuiFonts(const char* reason)
 - (CGFloat)armsx2NativeContentScale {
     UIScreen* screen = self.window.screen ?: UIScreen.mainScreen;
     CGFloat scale = screen.nativeScale > 0.0 ? screen.nativeScale : screen.scale;
-    if (scale <= 0.0)
-        scale = 1.0;
-
-    // iPhone 13 Pro Max performance experiment: reduce only the final iOS
-    // presentation surface. This does not change the PS2 internal resolution.
-    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-    id storedValue = [defaults objectForKey:@"ARMSX2_MetalPresentation2x"];
-    const BOOL use2xPresentation = storedValue ? [storedValue boolValue] : YES;
-    if (use2xPresentation)
-        scale = MIN(scale, (CGFloat)2.0);
-
-    return scale;
+    return scale > 0.0 ? scale : 1.0;
 }
 - (void)armsx2ApplyNativeContentScale {
     const CGFloat scale = [self armsx2NativeContentScale];
