@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (v9.6.1 A15 Metal + Juiced controls)
+name: Build ARMSX2 for iOS 16 (v9.6.2 A15 2x Metal + Juiced fix)
 
 on:
   workflow_dispatch:
@@ -706,17 +706,18 @@ jobs:
             platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift
           grep -q 'ARMSX2_MetalPresentation2x' \
             platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift
-          grep -q 'ARMSX2_MetalDrawableQueue2' \
-            platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift
-
           grep -q 'ARMSX2_IOS16_A15_METAL_NATIVE_V961' \
             platforms/ios/app/src/main/cpp/ios_main.mm
-          grep -q 'maximumDrawableCount = use2DrawableQueue ? 2 : 3' \
-            platforms/ios/app/src/main/cpp/ios_main.mm
+          if grep -q 'ARMSX2_MetalDrawableQueue2\|maximumDrawableCount = use2DrawableQueue' \
+            platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift \
+            platforms/ios/app/src/main/cpp/ios_main.mm; then
+            echo 'ERROR: rejected 2-frame drawable-queue experiment is still present.' >&2
+            exit 1
+          fi
 
           echo 'A15 target: OK'
           echo '2x Metal presentation scale: OK'
-          echo '2-frame Metal drawable queue: OK'
+          echo 'Metal drawable queue: stock behavior restored'
           echo 'Low Memory Mode: removed'
 
       - name: Add GT4 analog trigger pedals
@@ -2141,11 +2142,13 @@ jobs:
                       ARMSX2JuicedSetPS2Button(
                           pad_index, GenericInputBinding::L1, physical_cross);
 
-                      // The face buttons themselves are replaced in Juiced mode.
+                      // Preserve normal face-button states as well. This keeps
+                      // Cross/Square usable in Juiced menus while still mapping
+                      // them to rear-view/nitrous in races.
                       ARMSX2JuicedSetPS2Button(
-                          pad_index, GenericInputBinding::Square, 0.0f);
+                          pad_index, GenericInputBinding::Square, physical_square);
                       ARMSX2JuicedSetPS2Button(
-                          pad_index, GenericInputBinding::Cross, 0.0f);
+                          pad_index, GenericInputBinding::Cross, physical_cross);
                   }
               }
           '''
@@ -2165,8 +2168,8 @@ jobs:
           grep -q 'GenericInputBinding::L2, physical_l1' pcsx2/Input/SDLInputSource.cpp
           grep -q 'GenericInputBinding::R1, physical_square' pcsx2/Input/SDLInputSource.cpp
           grep -q 'GenericInputBinding::L1, physical_cross' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'GenericInputBinding::Square, 0.0f' pcsx2/Input/SDLInputSource.cpp
-          grep -q 'GenericInputBinding::Cross, 0.0f' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::Square, physical_square' pcsx2/Input/SDLInputSource.cpp
+          grep -q 'GenericInputBinding::Cross, physical_cross' pcsx2/Input/SDLInputSource.cpp
           echo 'Juiced exclusive routing V9.5.4: OK'
 
       - name: Show remaining iOS 17 source markers
@@ -2204,7 +2207,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.6.1-a15-metal-juiced
+          name: ARMSX2-iOS16-unsigned-v9.6.2-a15-2x-metal-juiced-fix
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2212,12 +2215,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.6.1-a15-metal-juiced
+          name: ARMSX2-iOS16-build-log-v9.6.2-a15-2x-metal-juiced-fix
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.1 A15-Metal Juiced build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.1-a15-metal-juiced and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.6.2 A15 2x-Metal Juiced-fix build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.2-a15-2x-metal-juiced-fix and inspect the first real error.' >&2
           exit 1
