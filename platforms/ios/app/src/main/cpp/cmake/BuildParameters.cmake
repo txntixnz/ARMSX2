@@ -135,7 +135,7 @@ elseif("${_PCSX2_TARGET_PROCESSOR}" STREQUAL "arm64" OR "${_PCSX2_TARGET_PROCESS
 		# XOR chains in the hash and CRC loops into eor3. An A12 then SIGILLs on
 		# the first one it reaches, which the game list scan hits on launch.
 		# -mcpu implies its own architecture, so there is no -march to disagree.
-		add_compile_options("-mcpu=apple-a12")
+		add_compile_options("-mcpu=apple-a15")
 	elseif(APPLE)
 		message(STATUS "Building for Apple Silicon (ARM64).")
 		# Min spec is an M1.
