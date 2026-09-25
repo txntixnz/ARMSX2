@@ -968,8 +968,11 @@ open class MainActivityRuntime : ComponentActivity() {
             instance?.runOnUiThread { instance?.applyEmulationOrientation() }
             // #254: cache whether this title runs with the emulated USB keyboard so
             // dispatchKeyEvent can forward physical-keyboard keys to it. applyTo()
-            // already pushed [USB1] Type + the live attach (usbSetKeyboardEnabled).
+            // already pushed [USB1] Type + the live attach (usbApplyPorts).
             usbKeyboardActive = resolved.system.usbKeyboard
+            // A Cal armed in the previous game must not turn this one's first shot into a
+            // calibration shot.
+            com.armsx2.input.Lightgun.calibrateNext.value = false
 
             // Neutralize the NATIVE pad analog deadzone before the VM loads [Pad1].
             // A stale [Pad1]/Deadzone in an existing config (from the old, non-saving
@@ -2749,6 +2752,9 @@ open class MainActivityRuntime : ComponentActivity() {
                         // music stayed silent until the user toggled it off/on. A longer, finer poll
                         // rides out the handover; a genuinely-playing third-party app just runs the
                         // poll out and is left alone.
+                        // start() no longer waits on game streams, ours included (see
+                        // LibraryMusic.otherMediaPlaying), so a game exit no longer holds it back;
+                        // the poll now covers the splash video and the pause-menu track letting go.
                         repeat(24) {
                             com.armsx2.LibraryMusic.start(this@MainActivityRuntime)
                             if (com.armsx2.LibraryMusic.isPlaying()) return@LaunchedEffect
