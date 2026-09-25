@@ -1,4 +1,4 @@
-name: Build ARMSX2 for iOS 16 (v9.6.3 A15 1.75x efficiency test)
+name: Build ARMSX2 for iOS 16 (v9.6.4 A15 GS pass coalescing test)
 
 on:
   workflow_dispatch:
@@ -724,6 +724,37 @@ jobs:
           echo '1.75x Metal efficiency scale: available, default OFF'
           echo 'Metal drawable queue: stock behavior restored'
           echo 'Low Memory Mode: removed'
+
+      - name: Apply Juiced GS render-pass coalescing test V9.6.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/ios16-gs-pass-coalescing-v964.py
+
+      - name: Verify Juiced GS render-pass coalescing test V9.6.4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -q 'ARMSX2_IOS16_GS_PASS_COALESCING_V964' \
+            platforms/ios/app/src/main/swift/Models/SettingsStore.swift
+          grep -q 'key: "CoalesceRenderPasses", default: false' \
+            platforms/ios/app/src/main/swift/Models/SettingsStore.swift
+          grep -q 'coalesceRenderPasses = _coalesceRenderPassesConfig.load()' \
+            platforms/ios/app/src/main/swift/Models/SettingsStore.swift
+          grep -q 'ARMSX2_IOS16_GS_PASS_COALESCING_UI_V964' \
+            platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift
+          grep -q 'GS Render-Pass Coalescing' \
+            platforms/ios/app/src/main/swift/Views/Settings/GraphicsSettingsView.swift
+
+          # Verify that this remains a frontend-only exposure of the upstream
+          # scheduler rather than a risky rewrite of GS internals.
+          grep -q 'SettingsWrapBitBool(CoalesceRenderPasses);' pcsx2/Pcsx2Config.cpp
+          grep -q 'GSConfig.CoalesceRenderPasses' pcsx2/GS/Renderers/Common/GSDevice.cpp
+
+          echo 'GS render-pass coalescing toggle: OK'
+          echo 'Default OFF: golden behavior preserved'
+          echo 'Core scheduler: upstream implementation unchanged'
 
       - name: Add GT4 analog trigger pedals
         shell: bash
@@ -2212,7 +2243,7 @@ jobs:
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-unsigned-v9.6.3-a15-175x-efficiency-test
+          name: ARMSX2-iOS16-unsigned-v9.6.4-a15-gs-pass-coalescing-test
           path: platforms/ios/build-ios-xcode/ARMSX2-iOS-unsigned.ipa
           if-no-files-found: error
 
@@ -2220,12 +2251,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ARMSX2-iOS16-build-log-v9.6.3-a15-175x-efficiency-test
+          name: ARMSX2-iOS16-build-log-v9.6.4-a15-gs-pass-coalescing-test
           path: platforms/ios/build-ios-xcode/xcodebuild.log
           if-no-files-found: ignore
 
       - name: Fail if source build failed
         if: steps.build.outcome == 'failure'
         run: |
-          echo 'The iOS 16 V9.6.3 A15 1.75x-efficiency build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.3-a15-175x-efficiency-test and inspect the first real error.' >&2
+          echo 'The iOS 16 V9.6.4 A15 GS pass-coalescing build reached a compiler/linker blocker. Download ARMSX2-iOS16-build-log-v9.6.4-a15-gs-pass-coalescing-test and inspect the first real error.' >&2
           exit 1
