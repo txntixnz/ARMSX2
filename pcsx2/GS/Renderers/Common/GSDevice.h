@@ -7,6 +7,7 @@
 #include "common/WindowInfo.h"
 #include "GS/GS.h"
 #include "GS/GSRegs.h" // GetAlphaTestPS speaks in ATST_* register values
+#include "GS/Renderers/Common/GSDrawRoad.h"
 #include "GS/Renderers/Common/GSFastList.h"
 #include "GS/Renderers/Common/GSGPUProfile.h"
 #include "GS/Renderers/Common/GSInterlaceModePolicy.h"
@@ -1335,6 +1336,7 @@ struct alignas(16) GSHWDrawConfig
 
 	bool require_one_barrier;  ///< Require texture barrier before draw (also used to requst an rt copy if texture barrier isn't supported)
 	bool require_full_barrier; ///< Require texture barrier between all prims
+	GSDrawRoad road;           ///< How the draw's self-read is served; decided by the renderer, see GSDrawRoad.h
 
 	enum : u32
 	{
@@ -1535,7 +1537,7 @@ public:
 		bool framebuffer_fetch    : 1; ///< Can sample from the framebuffer without texture barriers.
 		bool feedback_loop_layout : 1; ///< The backend reaches an attachment it also writes through the attachment-feedback-loop image layout and an ordinary sampler, rather than through an in-tile read. Vulkan-only, and mutually exclusive with `framebuffer_fetch` there.
 		bool framebuffer_fetch_orders_overlap : 1; ///< Framebuffer fetch also orders overlapping primitives *within* a single draw, so a full barrier is redundant. Vulkan's rasterization-order attachment access, Metal's programmable blending and GL's ARM_shader_framebuffer_fetch all guarantee this by spec; GL's EXT_shader_framebuffer_fetch does not deliver it in practice.
-		bool declared_feedback_loop_orders_overlap : 1; ///< The backend declares an attachment feedback loop on the pipeline and the attachment layout, and the driver answers by ordering overlapping primitives within one draw -- the same licence `framebuffer_fetch_orders_overlap` carries, earned a different way (Adreno/Turnip runs a declared-loop pass untiled with a coherent destination read). Set only by the Vulkan backend on the declared-loop road; see GSSelfReadRoadPolicy.h. ⚠️ The ordering is per PIXEL, so an offset read of the target keeps its one barrier on this road (GSRendererHW::DetermineBarriers) instead of taking the copy the in-tile read needs -- see GSSelfReadCopyPolicy.h.
+		bool declared_feedback_loop_orders_overlap : 1; ///< The backend declares an attachment feedback loop on the pipeline and the attachment layout, and the driver answers by ordering overlapping primitives within one draw -- the same licence `framebuffer_fetch_orders_overlap` carries, earned a different way (Adreno/Turnip runs a declared-loop pass untiled with a coherent destination read). Set only by the Vulkan backend on the declared-loop road; see GSSelfReadRoadPolicy.h. ⚠️ The ordering is per PIXEL, so an offset read of the target keeps its one barrier on this road instead of taking the copy the in-tile read needs -- see GSDrawRoad.h.
 		bool barrier_read_costs_per_draw : 1; ///< A per-draw texture barrier on this device was measured to cost about what a per-draw copy of the target does, as it does on a tiler: Adreno under Turnip and Apple silicon under Honeykrisp. Set by the Vulkan backend only. GSCopyRoadBlendingPolicy.h reads it to decide whether a destination read on the barrier road is expensive; everywhere it is false -- desktop Vulkan, GL, D3D, Metal -- the barrier road is treated as cheap, as it was before the policy existed.
 		bool stencil_buffer       : 1; ///< Supports stencil buffer, and can use for DATE.
 		bool cas_sharpening       : 1; ///< Supports sufficient functionality for contrast adaptive sharpening.
@@ -1550,6 +1552,7 @@ public:
 		bool dual_source_blend    : 1; ///< Supports a second fragment output (SRC1) as a hardware blend factor.
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
+		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
 		FeatureSupport()
 		{
 			memset(this, 0, sizeof(*this));

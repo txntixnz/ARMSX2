@@ -4,7 +4,6 @@
 #pragma once
 
 #include "GS/Renderers/Common/GSDevice.h"
-#include "GS/Renderers/Common/GSFeedbackLoopCarryPolicy.h"
 #include "GS/Renderers/Common/GSStreamRingMemoryPolicy.h"
 #include "GS/GSVector.h"
 #include "GS/Renderers/Vulkan/GSTextureVK.h"
@@ -26,6 +25,7 @@
 #include <vector>
 
 class VKSwapChain;
+struct GSSelfReadRoadDecision;
 
 class GSDeviceVK final : public GSDevice
 {
@@ -118,24 +118,16 @@ public:
 		return static_cast<u32>(m_device_properties.limits.optimalBufferCopyRowPitchAlignment);
 	}
 
-	/// Returns true if running on an NVIDIA GPU.
-	__fi bool IsDeviceNVIDIA() const { return (m_device_properties.vendorID == 0x10DE); }
-
-	/// Returns true if running on an AMD GPU.
-	__fi bool IsDeviceAMD() const { return (m_device_properties.vendorID == 0x1002); }
-
-	/// Returns true if running on an Intel GPU (vendorID 0x8086).
-	__fi bool IsDeviceIntel() const { return (m_device_properties.vendorID == 0x8086u); }
-
-	/// Returns true if running on a Broadcom V3D GPU (vendorID 0x14E4) — i.e. the
-	/// Raspberry Pi's VideoCore under Mesa's V3DV, reached via the Linux arm64 build.
-	__fi bool IsDeviceBroadcom() const { return (m_device_properties.vendorID == 0x14E4u); }
-
-	/// Returns true if running on an ARM Mali GPU (vendorID 0x13B5).
-	__fi bool IsDeviceMali() const { return (m_device_properties.vendorID == 0x13B5u); }
-
-	/// Returns true if running on a Qualcomm Adreno GPU (vendorID 0x5143).
-	__fi bool IsDeviceAdreno() const { return (m_device_properties.vendorID == 0x5143u); }
+	// Vendor checks by Vulkan vendor ID. They work before the driver properties are known, which
+	// SelectDeviceExtensions needs. Rules that also key on the driver or the device name are in
+	// m_device_rules.
+	__fi bool IsDeviceNVIDIA() const { return (m_device_properties.vendorID == GpuVendorID::NVIDIA); }
+	__fi bool IsDeviceAMD() const { return (m_device_properties.vendorID == GpuVendorID::AMD); }
+	__fi bool IsDeviceIntel() const { return (m_device_properties.vendorID == GpuVendorID::Intel); }
+	/// The Raspberry Pi's VideoCore under Mesa's V3DV, reached via the Linux arm64 build.
+	__fi bool IsDeviceBroadcom() const { return (m_device_properties.vendorID == GpuVendorID::Broadcom); }
+	__fi bool IsDeviceMali() const { return (m_device_properties.vendorID == GpuVendorID::ARM); }
+	__fi bool IsDeviceAdreno() const { return (m_device_properties.vendorID == GpuVendorID::Qualcomm); }
 
 	// Adreno-5xx / pre-0x801EA000 driver bug: colorWriteMask is ignored while a depth
 	// test is active (PPSSPP #10421). Cached in CheckFeatures, consumed in CreateTFXPipeline.
@@ -160,17 +152,9 @@ public:
 	// and still outranks the database where it is set.
 	bool m_force_feedback_loop_layout = false;
 
-	// The per-device inputs of the feedback-loop carry, resolved once in CheckFeatures. DoRenderHW
-	// adds the per-draw terms.
-	GSFeedbackLoopCarryInputs m_carry_device_facts;
-
-	/// Returns true if running on an Imagination PowerVR GPU (vendorID 0x1010).
-	__fi bool IsDevicePowerVR() const { return (m_device_properties.vendorID == 0x1010u); }
-
-	/// Returns true if running on a Samsung Xclipse (Exynos AMD-RDNA2) GPU.
-	/// NOTE: 0x144D (Samsung) is unverified across driver revisions — a real Xclipse tester
-	/// must confirm this fires; if it reports a different vendorID the gate is simply inert.
-	__fi bool IsDeviceXclipse() const { return (m_device_properties.vendorID == 0x144Du); }
+	__fi bool IsDevicePowerVR() const { return (m_device_properties.vendorID == GpuVendorID::Imagination); }
+	/// Samsung Xclipse (Exynos, AMD RDNA2).
+	__fi bool IsDeviceXclipse() const { return (m_device_properties.vendorID == GpuVendorID::Samsung); }
 
 	/// Returns true if running on an Apple GPU, under either MoltenVK or Asahi's Honeykrisp.
 	/// Unlike the checks above this gates on driverID, because Apple silicon does not report
@@ -301,6 +285,7 @@ private:
 	bool SelectDeviceFeatures();
 	bool CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer);
 	bool ProcessDeviceExtensions();
+	void ResolveDeviceIdentity();
 
 	bool CreateAllocator();
 	bool CreateCommandBuffers();
@@ -389,9 +374,14 @@ private:
 	// some type it declares, so growing the chain for it would never help. Warned once.
 	bool m_frame_pool_layout_refused_warned = false;
 
-	// Set false for Mali (vendorID 0x13B5) in CreateDevice: its driver crashes inside
-	// vkCmdPushDescriptorSetKHR, so texture binding falls back to per-frame descriptor sets.
+	// Cleared in ProcessDeviceExtensions where VulkanDeviceRules::avoid_push_descriptors says so;
+	// texture binding then uses per-frame descriptor sets.
 	bool m_use_push_descriptors = true;
+
+	// The resolved GPU and driver profile, and the device rules keyed on the device's identity.
+	// Both are resolved in ProcessDeviceExtensions, as soon as the driver properties are known.
+	GpuProfileSelection m_gpu_profile;
+	VulkanDeviceRules m_device_rules;
 
 	GSStreamRingMemoryDecision m_stream_ring_memory;
 
@@ -691,7 +681,25 @@ private:
 	VkShaderModule GetUtilityFragmentShader(const std::string& source, const char* replace_main);
 
 	bool CreateDeviceAndSwapChain();
+
+	/// Fills m_features and the device-constant state beside it. Runs once, after the device
+	/// exists and before any image, render pass or pipeline. The pieces below run in this order;
+	/// each reads only what an earlier one has made final.
 	bool CheckFeatures();
+	/// Publishes the GPU and driver profile to the device.
+	void PublishGPUProfile();
+	/// Framebuffer fetch, texture barriers and the declared-loop spelling: the self-read road.
+	GSSelfReadRoadDecision ResolveSelfReadRoad();
+	/// Feature bits that depend on the device alone, plus the road bits already set.
+	void ResolveFeatureTable();
+	/// The fast stencil shadow and the feedback-loop carry's device facts.
+	void ResolveFeedbackConsumers(const GSSelfReadRoadDecision& road);
+	/// Depth sampling and depth feedback. Returns whether the depth loop is declared.
+	bool ResolveDepthFeedback(const GSSelfReadRoadDecision& road);
+	void ResolveStreamRingMemory();
+	void LogResolvedFeatures(const GSSelfReadRoadDecision& road, bool declare_depth_loop);
+	/// Format support, texture size limits and ROV. False if a required format is missing.
+	bool CheckFormatSupport();
 	bool CreateNullTexture();
 	bool CreateBuffers();
 
