@@ -106,7 +106,29 @@ enum : u32
 	VERTEX_UNIFORM_BUFFER_SIZE = 4 * 1024 * 1024,
 	FRAGMENT_UNIFORM_BUFFER_SIZE = 4 * 1024 * 1024,
 	TEXTURE_BUFFER_SIZE = 32 * 1024 * 1024,
+
+	// The vertex ring starts at VERTEX_BUFFER_SIZE and doubles, up to this, only when a frame's
+	// vertices would otherwise make the GS thread wait for the GPU (GSStreamRingGrowth.h). A title
+	// whose frames fit never pays for more.
+	VERTEX_BUFFER_MAX_SIZE = 64 * 1024 * 1024,
+
+	// The smallest start gsrunner's -vertex-ring-kib may choose.
+	VERTEX_BUFFER_MIN_START_SIZE = 64 * 1024,
 };
+
+static constexpr u32 CountDoublings(u32 from, u32 to)
+{
+	u32 n = 0;
+	for (; from < to; from *= 2)
+		n++;
+	return n;
+}
+
+// How many persistent TFX UBO sets can be alive at once: the current one plus one retiring per
+// vertex-ring growth, since each growth rebinds the ring by handle. Sized for the smallest start,
+// though the shipped 16 -> 32 -> 64 MiB is only two growths.
+static constexpr u32 MAX_TFX_UBO_DESCRIPTOR_SETS =
+	1 + CountDoublings(VERTEX_BUFFER_MIN_START_SIZE, VERTEX_BUFFER_MAX_SIZE);
 
 
 #ifdef ENABLE_OGL_DEBUG
@@ -1310,9 +1332,12 @@ bool GSDeviceVK::CreateCommandBuffers()
 
 bool GSDeviceVK::CreateGlobalDescriptorPool()
 {
+	// The TFX UBO set holds two dynamic uniform buffers and up to two storage buffers, and up to
+	// MAX_TFX_UBO_DESCRIPTOR_SETS of it coexist while the vertex ring grows; the extra storage
+	// buffer is the spin set's.
 	static constexpr const VkDescriptorPoolSize pool_sizes[] = {
-		{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2},
-		{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3},
+		{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * MAX_TFX_UBO_DESCRIPTOR_SETS},
+		{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * MAX_TFX_UBO_DESCRIPTOR_SETS + 1},
 	};
 
 	VkDescriptorPoolCreateInfo pool_create_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,
@@ -5813,9 +5838,26 @@ void GSDeviceVK::FlushStreamRingWrites()
 
 bool GSDeviceVK::CreateBuffers()
 {
+	// With vertex expansion the whole ring is bound as one storage buffer, so it cannot outgrow
+	// the device's storage-buffer range.
+	u32 vertex_size = VERTEX_BUFFER_SIZE;
+	u32 vertex_max_size = VERTEX_BUFFER_MAX_SIZE;
+	if (g_gs_measurement_overrides.vertex_ring_start_kib != 0)
+		vertex_size = std::clamp<u32>(g_gs_measurement_overrides.vertex_ring_start_kib,
+						  VERTEX_BUFFER_MIN_START_SIZE / 1024, VERTEX_BUFFER_MAX_SIZE / 1024) * 1024;
+	if (g_gs_measurement_overrides.vertex_ring_no_growth)
+		vertex_max_size = vertex_size;
+	if (m_features.vs_expand)
+	{
+		vertex_max_size = static_cast<u32>(std::min<u64>(vertex_max_size, m_device_properties.limits.maxStorageBufferRange));
+		vertex_max_size = std::max<u32>(vertex_max_size, vertex_size);
+	}
+	if (g_gs_measurement_overrides.vertex_ring_start_kib != 0 || g_gs_measurement_overrides.vertex_ring_no_growth)
+		Console.WriteLn("VK: measurement overrides: vertex ring %u KiB, growth to %u KiB", vertex_size / 1024, vertex_max_size / 1024);
+
 	if (!m_vertex_stream_buffer.Create(
 			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | (m_features.vs_expand ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0),
-			VERTEX_BUFFER_SIZE, "vertex"))
+			vertex_size, "vertex", vertex_max_size))
 	{
 		Host::ReportErrorAsync("GS", "Failed to allocate vertex buffer");
 		return false;
@@ -8033,30 +8075,58 @@ void GSDeviceVK::InitializeState()
 
 bool GSDeviceVK::CreatePersistentDescriptorSets()
 {
+	m_tfx_ubo_descriptor_set = CreateTFXUBODescriptorSet();
+	return (m_tfx_ubo_descriptor_set != VK_NULL_HANDLE);
+}
+
+VkDescriptorSet GSDeviceVK::CreateTFXUBODescriptorSet()
+{
 	const VkDevice dev = m_device;
 	Vulkan::DescriptorSetUpdateBuilder dsub;
 
-	// Allocate UBO descriptor sets for TFX.
-	m_tfx_ubo_descriptor_set = AllocatePersistentDescriptorSet(m_tfx_ubo_ds_layout);
-	if (m_tfx_ubo_descriptor_set == VK_NULL_HANDLE)
-		return false;
-	dsub.AddBufferDescriptorWrite(m_tfx_ubo_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+	const VkDescriptorSet set = AllocatePersistentDescriptorSet(m_tfx_ubo_ds_layout);
+	if (set == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+	dsub.AddBufferDescriptorWrite(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 		m_vertex_uniform_stream_buffer.GetBuffer(), 0, sizeof(GSHWDrawConfig::VSConstantBuffer));
-	dsub.AddBufferDescriptorWrite(m_tfx_ubo_descriptor_set, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+	dsub.AddBufferDescriptorWrite(set, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 		m_fragment_uniform_stream_buffer.GetBuffer(), 0, sizeof(GSHWDrawConfig::PSConstantBuffer));
 	if (m_features.vs_expand)
 	{
-		dsub.AddBufferDescriptorWrite(m_tfx_ubo_descriptor_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-			m_vertex_stream_buffer.GetBuffer(), 0, VERTEX_BUFFER_SIZE);
+		dsub.AddBufferDescriptorWrite(set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			m_vertex_stream_buffer.GetBuffer(), 0, m_vertex_stream_buffer.GetCurrentSize());
 	}
 	if (m_features.aa1)
 	{
-		dsub.AddBufferDescriptorWrite(m_tfx_ubo_descriptor_set, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		dsub.AddBufferDescriptorWrite(set, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 			m_expand_index_stream_buffer.GetBuffer(), 0, INDEX_BUFFER_SIZE);
 	}
 	dsub.Update(dev);
-	Vulkan::SetObjectName(dev, m_tfx_ubo_descriptor_set, "Persistent TFX UBO set");
-	return true;
+	Vulkan::SetObjectName(dev, set, "Persistent TFX UBO set");
+	return set;
+}
+
+void GSDeviceVK::OnStreamRingReplaced(const VKStreamBuffer& ring)
+{
+	// Only the vertex ring is created with room to grow.
+	pxAssert(&ring == &m_vertex_stream_buffer);
+
+	// Draws already recorded keep the old buffer, which retires with this command buffer. Later
+	// draws, in this command buffer and every one after it, bind the new one.
+	SetInitialState(m_current_command_buffer);
+
+	if (m_features.vs_expand)
+	{
+		// The persistent set is in use by recorded and in-flight command buffers, so it cannot be
+		// rewritten in place: build a new one and free the old one when this command buffer retires.
+		const VkDescriptorSet old_set = m_tfx_ubo_descriptor_set;
+		m_tfx_ubo_descriptor_set = CreateTFXUBODescriptorSet();
+		if (m_tfx_ubo_descriptor_set == VK_NULL_HANDLE)
+			pxFailRel("Failed to allocate the TFX UBO descriptor set for the grown vertex ring");
+		m_frame_resources[m_current_frame].cleanup_resources.push_back(
+			[this, old_set]() { FreePersistentDescriptorSet(old_set); });
+		m_dirty_flags |= DIRTY_FLAG_TFX_UBO;
+	}
 }
 
 GSDeviceVK::WaitType GSDeviceVK::GetWaitType(bool wait, bool spin)
