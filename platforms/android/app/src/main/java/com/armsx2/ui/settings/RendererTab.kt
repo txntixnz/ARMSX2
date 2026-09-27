@@ -1009,6 +1009,12 @@ private fun ClearShaderCacheRow() {
             .clip(RoundedCornerShape(16.dp))
             .background(rowAura())
             .clickable {
+                // A running renderer holds the caches open and would write its pipelines back after
+                // the files were deleted, so the clear waits until the game is shut down.
+                if (MainActivityRuntime.eState.value != com.armsx2.EmuState.STOPPED) {
+                    Toast.makeText(context, I18n.get("renderer.clearShaderCache.stopGameFirst"), Toast.LENGTH_LONG).show()
+                    return@clickable
+                }
                 val n = clearShaderCache(File(MainActivityRuntime.assetCopyRoot(context), "cache"))
                 status.value = if (n > 0)
                     "Cleared $n shader-cache file${if (n == 1) "" else "s"}. Restart the game to rebuild."
@@ -1039,18 +1045,19 @@ private fun ClearShaderCacheRow() {
     }
 }
 
-/** Delete the on-disk compiled shader/pipeline caches (Vulkan + GL). They rebuild
- *  on the next renderer init; a stale/mismatched cache (e.g. after a driver change)
- *  can otherwise leave a game rendering corrupt. Returns how many files were removed. */
+/** Delete the on-disk compiled shader/pipeline caches: every renderer's files, their debug
+ *  variants, the per-game pipeline key lists, the frame-generation SPIR-V and any temporary file a
+ *  killed write left behind. They rebuild on the next renderer init. Same set as the core's
+ *  GSCacheFile::DeleteAll. Returns how many files were removed. */
 private fun clearShaderCache(cacheDir: File): Int {
-    val names = listOf(
-        "vulkan_pipelines.bin", "vulkan_shaders.bin", "vulkan_shaders.idx",
-        "gl_programs.bin", "gl_programs.idx",
-    )
+    val prefixes = listOf("vulkan_shaders", "vulkan_pipelines", "gl_programs", "lsfg_spirv")
     var removed = 0
-    for (name in names) {
-        val f = File(cacheDir, name)
-        if (f.isFile && runCatching { f.delete() }.getOrDefault(false)) removed++
+    cacheDir.listFiles()?.forEach { f ->
+        if (f.isFile && prefixes.any { f.name.startsWith(it) } && runCatching { f.delete() }.getOrDefault(false))
+            removed++
+    }
+    File(cacheDir, "vulkan_pipeline_keys").listFiles()?.forEach { f ->
+        if (runCatching { f.delete() }.getOrDefault(false)) removed++
     }
     return removed
 }

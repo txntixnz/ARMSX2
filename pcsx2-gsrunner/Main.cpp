@@ -58,6 +58,7 @@
 // ImGuiOverlays.cpp. Android has neither problem and nothing else needs the header.
 #include "pcsx2/GS/Renderers/Vulkan/VKLoader.h"
 #endif
+#include "pcsx2/GS/GSCompileStats.h"
 #include "pcsx2/GS/GSPerfMon.h"
 #include "pcsx2/GS/GSXXH.h"
 #include "pcsx2/GS/Renderers/Common/GSRenderer.h"
@@ -148,6 +149,8 @@ static constexpr u32 WINDOW_WIDTH = 640;
 static constexpr u32 WINDOW_HEIGHT = 480;
 
 static MemorySettingsInterface s_settings_interface;
+/// -clear-shader-cache-at-frame: the dump frame at which to clear, or -1.
+static s32 s_clear_shader_cache_frame = -1;
 
 static std::string s_output_prefix;
 static s32 s_loop_count = 1;
@@ -401,6 +404,20 @@ struct FrameSample
 	/// while faults are still high if pages are being re-faulted without growing RSS,
 	/// and can grow without a fault spike if the growth came from one large mmap.
 	u64 minflt_delta;
+
+	/// Shader and pipeline compilation in this frame, per stage (GSCompileStats.h). Counts and
+	/// times include work on compile worker threads; gs_stall_ms is what the GS thread waited.
+	u32 shader_sources;
+	u32 spirv_compiles;
+	u32 spirv_cache_hits;
+	u32 pipeline_creates;
+	u32 tfx_pipeline_misses;
+	float shader_source_ms;
+	float spirv_ms;
+	float module_ms;
+	float pipeline_ms;
+	float gs_stall_ms;
+	float cache_flush_ms;
 };
 // Work posted from other threads (the PINE server) to run on the CPU thread.
 static std::mutex s_cpu_thread_tasks_mutex;
@@ -415,6 +432,15 @@ static std::string s_driver_info;
 static u64 s_frame_timer_last = 0;
 static u64 s_gs_cpu_time_last = 0;
 static u64 s_minflt_last = 0;
+static u64 s_compile_last[GSCompileStats::Count] = {};
+static u64 s_compile_total[GSCompileStats::Count] = {};
+/// Compilation done before the VM started (device creation's utility pipelines), and the clocks
+/// at that point, so frame 0 -- which has no predecessor for frame_ms -- still gets a duration.
+static u64 s_compile_startup[GSCompileStats::Count] = {};
+static u64 s_vm_started_time = 0;
+static u64 s_vm_started_gs_cpu = 0;
+static float s_first_frame_ms = 0.0f;
+static float s_first_frame_gs_cpu_ms = 0.0f;
 static bool s_saw_gs_back_thread_in_stats = false;
 static double s_last_prims = 0;
 static double s_last_tc_source_hit = 0;
@@ -582,6 +608,11 @@ bool GSRunner::InitializeConfig()
 	Host::Internal::SetBaseSettingsLayer(&si);
 
 	VMManager::SetDefaultSettings(si, true, true, true, true, true);
+
+	// The app's default is on; a measurement must not have worker threads compiling beside the run
+	// unless it asks for them. Set before the command line is parsed, so -precompile-pipelines, -set
+	// and -ini can turn it back on.
+	si.SetBoolValue("EmuCore/GS", "PrecompilePipelines", false);
 
 	VMManager::Internal::LoadStartupSettings();
 	return true;
@@ -841,6 +872,40 @@ void Host::BeginPresentFrame()
 				s_minflt_last = minflt_now;
 			}
 
+			// Frame 0 has no frame_ms, so its duration is taken from VM start (after the GS
+			// device and its utility pipelines exist) to this present.
+			if (s_frame_samples.empty() && s_vm_started_time != 0)
+			{
+				s_first_frame_ms = static_cast<float>(Common::Timer::ConvertValueToMilliseconds(now - s_vm_started_time));
+				if (gs_cpu_now > s_vm_started_gs_cpu && s_vm_started_gs_cpu != 0)
+				{
+					s_first_frame_gs_cpu_ms = static_cast<float>(static_cast<double>(gs_cpu_now - s_vm_started_gs_cpu) * 1000.0 /
+					                                             static_cast<double>(Threading::GetThreadTicksPerSecond()));
+				}
+			}
+
+			// Deltas since VM start for the first sample: device creation is reported separately.
+			u64 compile_delta[GSCompileStats::Count];
+			for (u32 c = 0; c < GSCompileStats::Count; c++)
+			{
+				const u64 now_value = GSCompileStats::Get(static_cast<GSCompileStats::Counter>(c));
+				compile_delta[c] = now_value - s_compile_last[c];
+				s_compile_last[c] = now_value;
+				s_compile_total[c] += compile_delta[c];
+			}
+			const auto ns_to_ms = [](u64 ns) { return static_cast<float>(static_cast<double>(ns) / 1e6); };
+			sample.shader_sources = static_cast<u32>(compile_delta[GSCompileStats::ShaderSources]);
+			sample.spirv_compiles = static_cast<u32>(compile_delta[GSCompileStats::SpirvCompiles]);
+			sample.spirv_cache_hits = static_cast<u32>(compile_delta[GSCompileStats::SpirvCacheHits]);
+			sample.pipeline_creates = static_cast<u32>(compile_delta[GSCompileStats::PipelineCreates]);
+			sample.tfx_pipeline_misses = static_cast<u32>(compile_delta[GSCompileStats::TFXPipelineMisses]);
+			sample.shader_source_ms = ns_to_ms(compile_delta[GSCompileStats::ShaderSourceNs]);
+			sample.spirv_ms = ns_to_ms(compile_delta[GSCompileStats::SpirvCompileNs]);
+			sample.module_ms = ns_to_ms(compile_delta[GSCompileStats::ModuleCreateNs]);
+			sample.pipeline_ms = ns_to_ms(compile_delta[GSCompileStats::PipelineCreateNs]);
+			sample.gs_stall_ms = ns_to_ms(compile_delta[GSCompileStats::GSThreadStallNs]);
+			sample.cache_flush_ms = ns_to_ms(compile_delta[GSCompileStats::CacheFlushNs]);
+
 			s_saw_gs_back_thread_in_stats |= PerformanceMetrics::HasGSBackThread();
 			s_frame_samples.push_back(sample);
 		}
@@ -859,6 +924,13 @@ void Host::OnVMStarting()
 
 void Host::OnVMStarted()
 {
+	s_vm_started_time = Common::Timer::GetCurrentValue();
+	s_vm_started_gs_cpu = MTGS::GetThreadHandle().GetCPUTime();
+	for (u32 c = 0; c < GSCompileStats::Count; c++)
+	{
+		s_compile_startup[c] = GSCompileStats::Get(static_cast<GSCompileStats::Counter>(c));
+		s_compile_last[c] = s_compile_startup[c];
+	}
 }
 
 void Host::OnVMDestroyed()
@@ -1083,6 +1155,8 @@ static void PrintCommandLineHelp(const char* progname)
 						 "Dimensity 8300 in-tile framebuffer-fetch road; 'blank' restores FeatureSupport's own "
 						 "defaults, which is what the null arm reported before profiles existed. The resolved bits "
 						 "are printed at start-up. Ignored unless the renderer is nullhw.\n");
+	std::fprintf(stderr, "  -no-stencil-buffer: Vulkan only. Report no stencil buffer and create depth as plain D32F, as "
+						 "Turnip before Mesa 26.2 does, so destination-alpha tests take the no-stencil choices.\n");
 	std::fprintf(stderr, "  -swthreads <threads>: Sets the number of threads for the software renderer.\n");
 	std::fprintf(stderr, "  -upscale <multiplier>: Sets the upscale multiplier, e.g. 1 for native or 2 for 2x. Minimum 0.5.\n");
 	std::fprintf(stderr, "  -renderhacks [af|cpufb|dds|dpi|dsf|tinrt|plf]: Enable user hacks -- auto flush, CPU framebuffer "
@@ -1095,6 +1169,11 @@ static void PrintCommandLineHelp(const char* progname)
 	std::fprintf(stderr, "  -surfaceless: Disables showing a window.\n");
 	std::fprintf(stderr, "  -logfile <filename>: Writes emu log to filename.\n");
 	std::fprintf(stderr, "  -noshadercache: Disables the shader cache (useful for parallel runs).\n");
+	std::fprintf(stderr, "  -clear-shader-cache-at-frame <n>: Clears the shader cache once, at dump frame n, the way the "
+						 "settings button does while a renderer is open.\n");
+	std::fprintf(stderr, "  -precompile-pipelines: Build the dump's recorded Vulkan pipelines on worker threads at start, as the "
+						 "app does by default. Off unless asked for (this flag or -set EmuCore/GS/PrecompilePipelines=true), so "
+						 "a timed run has no background compilation competing with it.\n");
 	std::fprintf(stderr, "  -debugdevice: Enable the graphics API debug device (Vulkan validation layers / GL debug output). "
 						 "Slow; for diagnosing API misuse, not for measurement.\n");
 	std::fprintf(stderr, "  -perf: Enable frame timing performance stats.\n");
@@ -1580,6 +1659,16 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 
 				continue;
 			}
+			else if (CHECK_ARG_PARAM("-clear-shader-cache-at-frame"))
+			{
+				s_clear_shader_cache_frame = StringUtil::FromChars<s32>(argv[++i]).value_or(-1);
+				continue;
+			}
+			else if (CHECK_ARG("-precompile-pipelines"))
+			{
+				s_settings_interface.SetBoolValue("EmuCore/GS", "PrecompilePipelines", true);
+				continue;
+			}
 			else if (CHECK_ARG("-noshadercache"))
 			{
 				Console.WriteLn("Disabling shader cache");
@@ -1739,6 +1828,15 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				// Not a setting: it drops the barriers on request, which breaks blending on a desktop
 				// GPU. Read once in CheckFeatures, before anything that bakes the spelling in.
 				Console.WriteLn(fmt::format("Declaring the attachment feedback loop, arm {}", arm_arg));
+				continue;
+			}
+			else if (CHECK_ARG("-no-stencil-buffer"))
+			{
+				// Not a setting: whether a device may have a stencil buffer is a driver fact
+				// (vk-turnip-d32s8-early-z-late-z-hang). This puts that driver's destination-alpha
+				// choices on a device that has D32S8, for an A/B on one binary.
+				g_gs_measurement_overrides.disable_stencil_buffer = true;
+				Console.WriteLn("Forcing the stencil buffer off (depth as plain D32F)");
 				continue;
 			}
 			else if (CHECK_ARG("-declare-depth-feedback-loop"))
@@ -2204,6 +2302,29 @@ static void WriteStatsJson(const std::string& path)
 		rss_kb_first, rss_kb_last, rss_kb_max);
 	std::fprintf(fp.get(), "    \"frame_ms_p50\": %.3f,\n    \"frame_ms_p95\": %.3f,\n    \"frame_ms_p99\": %.3f,\n",
 		Percentile(frame_times, 0.50), Percentile(frame_times, 0.95), Percentile(frame_times, 0.99));
+	// Compilation totals over the sampled frames (GSCompileStats.h), counts then milliseconds.
+	std::fprintf(fp.get(),
+		"    \"compile\": {\"shader_sources\":%" PRIu64 ",\"spirv_compiles\":%" PRIu64 ",\"spirv_cache_hits\":%" PRIu64
+		",\"pipeline_creates\":%" PRIu64 ",\"tfx_pipeline_misses\":%" PRIu64 ",\"shader_source_ms\":%.3f,\"spirv_ms\":%.3f"
+		",\"module_ms\":%.3f,\"pipeline_ms\":%.3f,\"gs_stall_ms\":%.3f,\"cache_flush_ms\":%.3f,"
+		"\"precompile_built\":%" PRIu64 ",\"precompile_waits\":%" PRIu64 ",\"precompile_wait_ms\":%.3f},\n",
+		s_compile_total[GSCompileStats::ShaderSources], s_compile_total[GSCompileStats::SpirvCompiles],
+		s_compile_total[GSCompileStats::SpirvCacheHits], s_compile_total[GSCompileStats::PipelineCreates],
+		s_compile_total[GSCompileStats::TFXPipelineMisses], s_compile_total[GSCompileStats::ShaderSourceNs] / 1e6,
+		s_compile_total[GSCompileStats::SpirvCompileNs] / 1e6, s_compile_total[GSCompileStats::ModuleCreateNs] / 1e6,
+		s_compile_total[GSCompileStats::PipelineCreateNs] / 1e6, s_compile_total[GSCompileStats::GSThreadStallNs] / 1e6,
+		s_compile_total[GSCompileStats::CacheFlushNs] / 1e6,
+		GSCompileStats::Get(GSCompileStats::PrecompileBuilt), s_compile_total[GSCompileStats::PrecompileWaits],
+		s_compile_total[GSCompileStats::PrecompileWaitNs] / 1e6);
+	std::fprintf(fp.get(),
+		"    \"startup_compile\": {\"spirv_compiles\":%" PRIu64 ",\"spirv_cache_hits\":%" PRIu64 ",\"pipeline_creates\":%" PRIu64
+		",\"spirv_ms\":%.3f,\"pipeline_ms\":%.3f},\n",
+		s_compile_startup[GSCompileStats::SpirvCompiles], s_compile_startup[GSCompileStats::SpirvCacheHits],
+		s_compile_startup[GSCompileStats::PipelineCreates], s_compile_startup[GSCompileStats::SpirvCompileNs] / 1e6,
+		s_compile_startup[GSCompileStats::PipelineCreateNs] / 1e6);
+	// frame_ms of frame 0 stays 0 (and out of the percentiles above); these give it a duration.
+	std::fprintf(fp.get(), "    \"first_frame_ms\": %.3f,\n    \"first_frame_gs_cpu_ms\": %.3f,\n", s_first_frame_ms,
+		s_first_frame_gs_cpu_ms);
 	std::fprintf(fp.get(), "    \"frame_ms_worst\": %.3f,\n    \"frame_worst_index\": %u\n  },\n", worst_ms, worst_frame);
 
 	std::fprintf(fp.get(), "  \"frames\": [\n");
@@ -2226,7 +2347,10 @@ static void WriteStatsJson(const std::string& path)
 			"\"hash_cache_hit\":%" PRIu64 ",\"hash_cache_miss\":%" PRIu64 ","
 			"\"pipeline_switches\":%s,\"gpu_blocking_waits\":%s,"
 			"\"native_texel_grid_draws\":%" PRIu64 ",\"sw_palette_block_copies\":%" PRIu64 ","
-			"\"rss_kb\":%" PRIu64 ",\"minflt_delta\":%" PRIu64 "}%s\n",
+			"\"rss_kb\":%" PRIu64 ",\"minflt_delta\":%" PRIu64 ","
+			"\"shader_sources\":%u,\"spirv_compiles\":%u,\"spirv_cache_hits\":%u,\"pipeline_creates\":%u,"
+			"\"tfx_pipeline_misses\":%u,\"shader_source_ms\":%.3f,\"spirv_ms\":%.3f,\"module_ms\":%.3f,"
+			"\"pipeline_ms\":%.3f,\"gs_stall_ms\":%.3f,\"cache_flush_ms\":%.3f}%s\n",
 			s.frame, s.frame_in_dump, s.idle ? "true" : "false", s.frame_ms, gpu_ms_str.c_str(), s.gs_cpu_ms,
 			s.prims, s.draws, s.draw_calls,
 			j_u64(s.render_passes).c_str(), j_u64(s.render_pass_area_pixels).c_str(), j_u64(s.barriers).c_str(), j_u64(s.copies).c_str(),
@@ -2238,6 +2362,9 @@ static void WriteStatsJson(const std::string& path)
 			j_u64(s.pipeline_switches).c_str(), j_u64(s.gpu_blocking_waits).c_str(),
 			s.native_texel_grid_draws, s.sw_palette_block_copies,
 			s.rss_kb, s.minflt_delta,
+			s.shader_sources, s.spirv_compiles, s.spirv_cache_hits, s.pipeline_creates,
+			s.tfx_pipeline_misses, s.shader_source_ms, s.spirv_ms, s.module_ms,
+			s.pipeline_ms, s.gs_stall_ms, s.cache_flush_ms,
 			(i + 1 < s_frame_samples.size()) ? "," : "");
 	}
 	std::fprintf(fp.get(), "  ]\n}\n");
@@ -2692,6 +2819,12 @@ void Host::PumpMessagesOnCPUThread()
 			s_cpu_thread_tasks.pop_front();
 		}
 		task();
+	}
+
+	if (s_clear_shader_cache_frame >= 0 && static_cast<s32>(GSDumpReplayer::GetFrameNumber()) == s_clear_shader_cache_frame)
+	{
+		s_clear_shader_cache_frame = -1;
+		GSClearShaderCache([](u32 removed) { INFO_LOG("gsrunner: cleared the shader cache ({} files)", removed); });
 	}
 
 	// update GS thread copy of frame number
