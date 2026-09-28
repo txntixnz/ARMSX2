@@ -563,7 +563,9 @@ void GSState::SetPrimHandlers()
 	m_fpGIFPackedRegHandlerLayout[GIF_REG_UVXYZ2 - 2][P] = \
 		LayoutHandlerOrNull<P, GSVertexKernels::PackedLayout::PairUVXYZ2, auto_flush>(); \
 	m_fpGIFPackedRegHandlerLayout[GIF_REG_RGBAQXYZ2 - 2][P] = \
-		LayoutHandlerOrNull<P, GSVertexKernels::PackedLayout::PairRGBAQXYZ2, auto_flush>();
+		LayoutHandlerOrNull<P, GSVertexKernels::PackedLayout::PairRGBAQXYZ2, auto_flush>(); \
+	m_fpGIFPackedRegHandlerLayout[GIF_REG_UVRGBAQXYZF2 - 2][P] = \
+		LayoutHandlerOrNull<P, GSVertexKernels::PackedLayout::UvTripleXYZF2, auto_flush>();
 
 	SetHandlerXYZ(GS_POINTLIST, true);
 	SetHandlerXYZ(GS_LINELIST, non_sprite_af);
@@ -2083,15 +2085,19 @@ __noinline bool GIFClassifyPaddedLayout(const GSVector4i& regs, u32 nreg, u32& t
 	}
 
 	// {ST, RGBAQ, XYZF2} with NOPs between: most of outrun-b's and mgs3's traffic.
+	// {UV, RGBAQ, XYZF2} with NOPs between is the same triple addressed by UV.
 	if (n == 3)
 	{
-		if (desc[0] == GIF_REG_STQ && desc[1] == GIF_REG_RGBA && desc[2] == GIF_REG_XYZF2)
-		{
+		if (desc[1] != GIF_REG_RGBA || desc[2] != GIF_REG_XYZF2)
+			return false;
+		if (desc[0] == GIF_REG_STQ)
 			type = GIFPath::TYPE_NOPSTQRGBAXYZF2;
-			layout = {nreg, pos[0], pos[1], pos[2]};
-			return true;
-		}
-		return false;
+		else if (desc[0] == GIF_REG_UV)
+			type = GIFPath::TYPE_UVRGBAQXYZF2;
+		else
+			return false;
+		layout = {nreg, pos[0], pos[1], pos[2]};
+		return true;
 	}
 
 	// The two-register layouts, NOP-padded. XYZF2 twins are deliberately not
@@ -2900,7 +2906,7 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 	u32 done = 0;
 	if (m_dirty_gs_regs)
 	{
-		constexpr u32 reg_a = (layout == GSVertexKernels::PackedLayout::PairUVXYZ2) ?
+		constexpr u32 reg_a = GSVertexKernels::LayoutHasUV(layout) ?
 								  GIF_REG_UV :
 								  ((layout == GSVertexKernels::PackedLayout::PairRGBAQXYZ2) ? GIF_REG_RGBA :
 																							  GIF_REG_STQ);
@@ -2913,7 +2919,7 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 		{
 			const GIFPackedReg* RESTRICT rv = r + done * stride;
 			ReplayPackedQword(reg_a, rv + off_a);
-			if constexpr (GSVertexKernels::LayoutIsTriple(layout))
+			if constexpr (GSVertexKernels::LayoutHasSeparateRgba(layout))
 				ReplayPackedQword(GIF_REG_RGBA, rv + off_rgba);
 			ReplayPackedQword(reg_xyz, rv + off_xyz);
 			done++;
@@ -2924,7 +2930,7 @@ void GSState::GIFPackedRegHandlerLayout(const GIFPackedReg* RESTRICT r, u32 size
 		CheckFlushes();
 	}
 
-	if constexpr (layout == GSVertexKernels::PackedLayout::PairUVXYZ2)
+	if constexpr (GSVertexKernels::LayoutHasUV(layout))
 	{
 		// UserHacks_ForceEvenSpritePosition swaps GIFPackedRegHandlerUV for a
 		// version whose only extra effect is this sticky flag. Nothing inside one

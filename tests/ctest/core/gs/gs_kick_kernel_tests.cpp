@@ -418,6 +418,8 @@ namespace
 					return LayoutShipsFor<GSVertexKernels::PackedLayout::PairUVXYZ2>(prim);
 				case GSVertexKernels::PackedLayout::PairRGBAQXYZ2:
 					return LayoutShipsFor<GSVertexKernels::PackedLayout::PairRGBAQXYZ2>(prim);
+				case GSVertexKernels::PackedLayout::UvTripleXYZF2:
+					return LayoutShipsFor<GSVertexKernels::PackedLayout::UvTripleXYZF2>(prim);
 				default: return false;
 			}
 		}
@@ -2010,6 +2012,35 @@ TEST(GifSetTag, NopPaddedTriples)
 	}
 }
 
+TEST(GifSetTag, UvTriples)
+{
+	struct Case
+	{
+		std::vector<u8> descs;
+		u32 stride, off_uv, off_rgba, off_xyz;
+	};
+	// {UV, RGBAQ, XYZF2}, contiguous and with the NOP arrangements a UV-addressed
+	// triangle-strip stream uses.
+	const Case cases[] = {
+		{{3, 1, 4}, 3, 0, 1, 2},
+		{{3, 0xF, 1, 4}, 4, 0, 2, 3},
+		{{0xF, 3, 1, 4}, 4, 1, 2, 3},
+		{{0xF, 0xF, 3, 1, 4}, 5, 2, 3, 4},
+	};
+	for (const Case& c : cases)
+	{
+		const GIFPath p = ClassifyTag(c.descs, 9);
+		SCOPED_TRACE(::testing::Message() << "nreg=" << c.descs.size());
+		EXPECT_EQ(p.type, static_cast<u32>(GIFPath::TYPE_UVRGBAQXYZF2));
+		EXPECT_EQ(p.nreg, c.stride) << "the tag keeps its nreg";
+		EXPECT_EQ(p.nloop, 9u);
+		EXPECT_EQ(p.layout.stride, c.stride);
+		EXPECT_EQ(p.layout.off_a, c.off_uv);
+		EXPECT_EQ(p.layout.off_rgba, c.off_rgba);
+		EXPECT_EQ(p.layout.off_xyz, c.off_xyz);
+	}
+}
+
 TEST(GifSetTag, NopPaddedPairs)
 {
 	// stuntman's 3:f,1,5 -- 4.8% of its packed qwords.
@@ -2035,7 +2066,8 @@ TEST(GifSetTag, LayoutsThatMustStayUnknown)
 		{0xF, 0xF, 1, 4},                            // outrun-b: no ST to carry from
 		{2, 1, 4, 2, 0xF, 4},                        // mgs3: two vertices, unlike members
 		{1, 3, 4},                                   // mgs3: {RGBAQ, UV, XYZF2}
-		{3, 1, 4},                                   // katamari
+		{3, 0xF, 4, 1},                              // UV triple members out of order
+		{3, 1, 0xF, 5},                              // UV triple with XYZ2: not recognised
 		{1, 3, 5, 3, 5},                             // stuntman, xenosaga
 		{6, 1, 3, 5, 3, 5},                          // xenosaga
 		{2, 1, 4, 2, 4, 2, 4, 2, 4},                 // flatout2
@@ -2216,6 +2248,9 @@ namespace
 	const LayoutCase kPairUV = {"2:3,5", {3, 5}, {2, 0, 0, 1}, GSVertexKernels::PackedLayout::PairUVXYZ2};
 	const LayoutCase kPairRGBAQ = {"2:1,5", {1, 5}, {2, 0, 0, 1}, GSVertexKernels::PackedLayout::PairRGBAQXYZ2};
 	const LayoutCase kPairRGBAQNop = {"3:f,1,5", {0xF, 1, 5}, {3, 1, 0, 2}, GSVertexKernels::PackedLayout::PairRGBAQXYZ2};
+	const LayoutCase kUvTriple = {"3:3,1,4", {3, 1, 4}, {3, 0, 1, 2}, GSVertexKernels::PackedLayout::UvTripleXYZF2};
+	const LayoutCase kUvTriple40 = {"4:3,f,1,4", {3, 0xF, 1, 4}, {4, 0, 2, 3}, GSVertexKernels::PackedLayout::UvTripleXYZF2};
+	const LayoutCase kUvTriple41 = {"4:f,3,1,4", {0xF, 3, 1, 4}, {4, 1, 2, 3}, GSVertexKernels::PackedLayout::UvTripleXYZF2};
 } // namespace
 
 // The layouts against the per-qword path, over the whole prim / ADC / run-length
@@ -2247,6 +2282,10 @@ TEST(GsKickKernel, LayoutsMatchThePerQwordPath)
 						KickSetup{}, prim, kPairRGBAQ, v, {len}, use_kernel);
 					RunAndCompareLayout<GSVertexKernels::PackedLayout::PairRGBAQXYZ2>(
 						KickSetup{}, prim, kPairRGBAQNop, v, {len}, use_kernel);
+					RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+						KickSetup{}, prim, kUvTriple, v, {len}, use_kernel);
+					RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+						KickSetup{}, prim, kUvTriple40, v, {len}, use_kernel);
 				}
 			}
 		}
@@ -2274,6 +2313,8 @@ TEST(GsKickKernel, LayoutsMatchAcrossCallSplits)
 				KickSetup{}, prim, kPairUV, v, calls);
 			RunAndCompareLayout<GSVertexKernels::PackedLayout::PairRGBAQXYZ2>(
 				KickSetup{}, prim, kPairRGBAQ, v, calls);
+			RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+				KickSetup{}, prim, kUvTriple41, v, calls);
 		}
 	}
 }
@@ -2300,6 +2341,8 @@ TEST(GsKickKernel, LayoutsMatchOnTheAutoFlushArm)
 					s, prim, kPairUV, v, {len}, true, true);
 				RunAndCompareLayout<GSVertexKernels::PackedLayout::PairRGBAQXYZ2>(
 					s, prim, kPairRGBAQ, v, {len}, true, true);
+				RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+					s, prim, kUvTriple, v, {len}, true, true);
 			}
 		}
 	}
@@ -2348,6 +2391,8 @@ TEST(GsKickKernel, LayoutsPickUpAnEnvironmentMovingUnderTheRun)
 			s, prim, kPairRGBAQ, v, {5000}, true, false, true);
 		RunAndCompareLayout<GSVertexKernels::PackedLayout::NopTripleXYZF2>(
 			s, prim, kNopTriple52, v, {5000}, true, false, true);
+		RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+			s, prim, kUvTriple40, v, {5000}, true, false, true);
 	}
 }
 
@@ -2419,6 +2464,15 @@ TEST(GsKickKernel, LayoutUVSetsThePackedUVHackFlag)
 		p->KickLayoutCall<GS_SPRITE, GSVertexKernels::PackedLayout::PairUVXYZ2>(
 			stream.data(), static_cast<u32>(stream.size()), kPairUV.off);
 		EXPECT_EQ(p->m_isPackedUV_HackFlag, hack);
+
+		RunAndCompareLayout<GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+			KickSetup{}, GS_TRIANGLESTRIP, kUvTriple, v, {12u});
+		auto t = MakeProbe(KickSetup{}, GS_TRIANGLESTRIP, true);
+		SeedLatchedState(*t);
+		const std::vector<GIFPackedReg> tri = EncodeLayoutStream(v, kUvTriple.descs);
+		t->KickLayoutCall<GS_TRIANGLESTRIP, GSVertexKernels::PackedLayout::UvTripleXYZF2>(
+			tri.data(), static_cast<u32>(tri.size()), kUvTriple.off);
+		EXPECT_EQ(t->m_isPackedUV_HackFlag, hack);
 	}
 	GSConfig.UserHacks_ForceEvenSpritePosition = saved;
 }
@@ -2552,7 +2606,8 @@ namespace
 TEST(GsKickKernel, TagFinishedByTheMidRecordResumeIsNotDispatched)
 {
 	u32 seed = 9900;
-	const LayoutCase* cases[] = {&kNopTriple40, &kNopTriple52, &kPairSTQ, &kPairUV, &kPairRGBAQ};
+	const LayoutCase* cases[] = {&kNopTriple40, &kNopTriple52, &kPairSTQ, &kPairUV, &kPairRGBAQ, &kUvTriple,
+		&kUvTriple41};
 	for (const LayoutCase* lc : cases)
 	{
 		for (u32 prim : {GS_TRIANGLESTRIP, GS_SPRITE})
@@ -2597,7 +2652,7 @@ TEST(GsKickKernel, LayoutsMatchThroughTransfer)
 {
 	u32 seed = 9700;
 	const LayoutCase* cases[] = {&kNopTriple40, &kNopTriple41, &kNopTriple52, &kPairSTQ, &kPairUV,
-		&kPairRGBAQ, &kPairRGBAQNop};
+		&kPairRGBAQ, &kPairRGBAQNop, &kUvTriple, &kUvTriple40, &kUvTriple41};
 	for (const LayoutCase* lc : cases)
 	{
 		for (u32 prim : {GS_TRIANGLESTRIP, GS_SPRITE})
@@ -2653,7 +2708,7 @@ TEST(GsKickKernel, LayoutsMatchThroughTransferWithDrawBuffering)
 {
 	u32 seed = 9900;
 	const LayoutCase* cases[] = {&kNopTriple40, &kNopTriple41, &kPairSTQ, &kPairUV, &kPairRGBAQ,
-		&kPairRGBAQNop};
+		&kPairRGBAQNop, &kUvTriple, &kUvTriple41};
 	for (const LayoutCase* lc : cases)
 	{
 		for (u32 prim : {GS_TRIANGLESTRIP, GS_SPRITE})

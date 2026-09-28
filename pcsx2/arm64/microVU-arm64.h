@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 #include <arm_neon.h>
+#include <cstring>
 #include "Common.h"
 #include "VU.h"
 #include "MTVU.h"
@@ -882,7 +883,7 @@ public:
 			{
 				if (mVUsFlagHack)
 				{
-					if ((ref.quick & ~0x0C04) != (quick64 & ~0x0C04)) continue;
+					if ((ref.quick & ~0x3002) != (quick64 & ~0x3002)) continue;
 				}
 				else if (ref.quick != quick64) continue;
 

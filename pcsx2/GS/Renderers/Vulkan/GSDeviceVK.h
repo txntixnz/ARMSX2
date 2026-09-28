@@ -147,6 +147,8 @@ public:
 	// exists -- a pipeline's dynamic-state list cannot be changed afterwards -- and read in
 	// CreateTFXPipeline and per draw in DoRenderHW.
 	bool m_declare_loop_per_draw = false;
+	// A draw in the current render pass has declared a feedback loop (GSLoopEnableWritesForDraw).
+	bool m_loop_declared_in_pass = false;
 
 	// Take the attachment-feedback-loop spelling even on a device that advertises
 	// rasterization-order attachment access. Decided by GSSelfReadRoadPolicy.h, written once in
@@ -323,7 +325,6 @@ private:
 	void CalibrateSpinTimestamp();
 	u64 GetCPUTimestamp();
 
-	// For pipeline statistics
 	enum class QueryState
 	{
 		None,
@@ -356,7 +357,7 @@ private:
 		u32 submit_timestamp = 0;
 		bool init_buffer_used = false;
 		bool needs_fence_wait = false;
-		bool timestamp_written = false;
+		QueryState timestamp_query_state = QueryState::None;
 		QueryState pipeline_statistics_query = QueryState::None;
 
 		std::vector<std::function<void()>> cleanup_resources;
@@ -836,6 +837,9 @@ public:
 	bool IsPresenting() const;
 
 	bool SetGPUTimingEnabled(bool enabled) override;
+	void StartGPUTiming(u32 index);
+	void EndGPUTiming(u32 index);
+	void ReadGPUTiming(u32 index);
 	float GetAndResetAccumulatedGPUTime() override;
 
 	bool SetGPUPipelineStatisticsEnabled(bool enabled) override;

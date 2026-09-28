@@ -5696,23 +5696,31 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 	// Invalidate any opposite targets.
 	g_texture_cache->InvalidateVideoMemType(GSTextureCache::DepthStencil - dst->m_type, dst->m_TEX0.TBP0);
 
-	// Expand the target when we used a more conservative size.
+	// Expand the target when we used a more conservative size. Width grows too, as long as the
+	// move stays inside the destination's buffer width: a small target the game later moves a
+	// wider block into would otherwise send the move to the CPU, behind a synchronous readback.
+	const int required_dw = scaled_dx + scaled_w;
 	const int required_dh = scaled_dy + scaled_h;
-	if ((scaled_dx + scaled_w) <= dst->m_texture->GetWidth() && required_dh > dst->m_texture->GetHeight())
+	const bool grow_w = required_dw > dst->m_texture->GetWidth() && (dx + w) <= static_cast<int>(DBW * 64);
+	if ((required_dw <= dst->m_texture->GetWidth() || grow_w) &&
+		(grow_w || required_dh > dst->m_texture->GetHeight()))
 	{
-		int new_height = dy + h;
+		int new_height = std::max(dy + h, dst->m_unscaled_size.y);
 		if (new_height > GSRendererHW::MAX_FRAMEBUFFER_HEIGHT)
 			return false;
 
 		// Align height to page size, that way we don't do too many small resizes (Dark Cloud).
 		new_height = Common::AlignUpPow2(new_height, static_cast<unsigned>(GSLocalMemory::m_psm[DPSM].bs.y));
+		const int new_width = grow_w ?
+			std::max(dst->m_unscaled_size.x, Common::AlignUpPow2(dx + w, static_cast<unsigned>(GSLocalMemory::m_psm[DPSM].pgs.x))) :
+			dst->m_unscaled_size.x;
 
 		// We don't recycle the old texture here, because the height cache will track the new size,
 		// so the old size won't get created again.
-		GL_INS("TC: Resize %dx%d target to %dx%d for move", dst->m_unscaled_size.x, dst->m_unscaled_size.y, dst->m_unscaled_size.x, new_height);
-		GetTargetSize(DBP, DBW, DPSM, 0, new_height);
+		GL_INS("TC: Resize %dx%d target to %dx%d for move", dst->m_unscaled_size.x, dst->m_unscaled_size.y, new_width, new_height);
+		GetTargetSize(DBP, DBW, DPSM, grow_w ? new_width : 0, new_height);
 
-		if (!dst->ResizeTexture(dst->m_unscaled_size.x, new_height, false))
+		if (!dst->ResizeTexture(new_width, new_height, false))
 		{
 			// Resize failed, probably ran out of VRAM, better luck next time. Fall back to CPU.
 			// We injected the new height into the cache, so hopefully won't happen again.
@@ -5925,6 +5933,8 @@ bool GSTextureCache::ShuffleMove(u32 BP, u32 BW, u32 PSM, int sx, int sy, int dx
 	if (read_ba || !write_rg)
 		tgt->UnscaleRTAlpha();
 
+	tgt->Update();
+
 	GSHWDrawConfig& config = GSRendererHW::GetInstance()->BeginHLEHardwareDraw(tgt->m_texture, nullptr, tgt->m_scale, tgt->m_texture, tgt->m_scale, bbox);
 	config.colormask.wrgba = (write_rg ? (1 | 2) : (4 | 8));
 	config.ps.process_ba = read_ba ? 1 : 0;
@@ -6007,6 +6017,15 @@ bool GSTextureCache::PageMove(u32 SBP, u32 DBP, u32 BW, u32 PSM, int sx, int sy,
 		GL_INS("TC: Effective SBP of %x or DBP of %x is not page aligned.", SBP - stgt->m_TEX0.TBP0, DBP - dtgt->m_TEX0.TBP0);
 		return false;
 	}
+
+	// We don't want to copy "old" data that the game has overwritten with writes,
+	// so flush any overlapping dirty area.
+	// We pass that this is an invalidation to the translate function just to get a rough rect, we don't care if it's slightly for an overlap check.
+	stgt->UpdateIfDirtyIntersects(TranslateAlignedRectByPage(stgt, SBP, PSM, BW, GSVector4i(sx, sy, sx + w, sy + h), true));
+
+	// The main point of HW moves is so GPU data can get used as sources. If we don't flush all writes,
+	// we're not going to be able to use it as a source.
+	dtgt->Update();
 
 	// Need to offset based on the target's actual BP.
 	const u32 real_src_offset = ((SBP - stgt->m_TEX0.TBP0) / GS_BLOCKS_PER_PAGE) + src_page_offset;
