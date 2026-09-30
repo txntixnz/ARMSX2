@@ -426,6 +426,8 @@ public:
 	void Destroy() override;
 
 	void UpdateRenderFixes() override;
+	bool DrawClearsScanMask() const override;
+	bool HasMoveHook() const override { return m_mv != nullptr; }
 
 	bool CanUpscale() override;
 	float GetUpscaleMultiplier() override;

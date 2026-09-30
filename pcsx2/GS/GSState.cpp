@@ -10,6 +10,7 @@
 #include "GS/GSUtil.h"
 #include "GS/GSVertexKick.h"
 #include "PerformanceMetrics.h"
+#include "VMManager.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
@@ -26,6 +27,7 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/prctl.h>
 #endif
 
 
@@ -627,13 +629,18 @@ void GSState::ResetDrawBufferIdx()
 				continue;
 			}
 
-			memcpy(m_vertex_buffers[entry_ptr].buff, m_vertex_buffers[i].buff, sizeof(GSVertex) * m_vertex_buffers[i].tail);
+			// Hand the pending arrays to the empty slot rather than copying into its own. Slots
+			// grow independently, and on the split every flush exchanges a slot's arrays for a
+			// pool node's, so the destination's arrays can be smaller than what is pending.
+			std::swap(m_vertex_buffers[entry_ptr].buff, m_vertex_buffers[i].buff);
+			std::swap(m_vertex_buffers[entry_ptr].buff_copy, m_vertex_buffers[i].buff_copy);
+			std::swap(m_vertex_buffers[entry_ptr].maxcount, m_vertex_buffers[i].maxcount);
+			std::swap(m_index_buffers[entry_ptr].buff, m_index_buffers[i].buff);
 
 			m_vertex_buffers[entry_ptr].head = m_vertex_buffers[i].head;
 			m_vertex_buffers[entry_ptr].tail = m_vertex_buffers[i].tail;
 			m_vertex_buffers[entry_ptr].next = m_vertex_buffers[i].next;
 
-			memcpy(m_index_buffers[entry_ptr].buff, m_index_buffers[i].buff, sizeof(u16) * m_index_buffers[i].tail);
 			m_index_buffers[entry_ptr].tail = m_index_buffers[i].tail;
 
 			if (m_vertex_buffers[entry_ptr].tail != 0)
@@ -720,7 +727,7 @@ void GSState::ResetDrawBuffers()
 GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 {
 	// Recycle first; grow the arena while under the cap; past the cap the ring
-	// IS the backpressure (wait for the consumer to release one).
+	// IS the backpressure (wait for the consumer to release a batch).
 	for (;;)
 	{
 		if (GSBackQueue::DrawNode** slot = m_chan->draw_free.Peek())
@@ -733,7 +740,9 @@ GSBackQueue::DrawNode* GSState::AcquireDrawNode()
 		if (m_chan->draw_arena.size() < GSBackQueue::Channel::kMaxDrawNodes)
 			break;
 
-		std::this_thread::yield();
+		m_chan->space.Wait([this]() {
+			return m_chan->draw_free.Size() >= GSBackQueue::Channel::kDrawRefill;
+		});
 	}
 
 	// Fresh node, arrays sized like the buffer they're about to replace
@@ -784,7 +793,9 @@ GSBackQueue::PayloadNode* GSState::AcquirePayloadNode()
 		if (m_chan->payload_arena.size() < GSBackQueue::Channel::kMaxPayloadNodes)
 			break;
 
-		std::this_thread::yield();
+		m_chan->space.Wait([this]() {
+			return m_chan->payload_free.Size() >= GSBackQueue::Channel::kPayloadRefill;
+		});
 	}
 
 	constexpr size_t alloc_size = 1024 * 1024 * 4; // = GSTransferBuffer's buffer
@@ -829,6 +840,13 @@ void GSState::StartBackThread()
 	// Claim the empty-wait for this thread (the MTGS thread — every drain site
 	// runs on it). See Channel::drain_thread.
 	m_chan->drain_thread = std::this_thread::get_id();
+#if defined(__linux__)
+	// This thread is the producer, and its waits for ring or pool space are
+	// timed in tens of microseconds (GSBackQueue::SpaceWait). The default 50us
+	// timer slack would stretch every one of them past the point where the back
+	// thread has to wake it with a post, which is the cost the timeout avoids.
+	prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
+#endif
 	m_back_thread = std::thread(&GSState::BackThreadLoop, this);
 	Console.WriteLn("GS: back thread started (pipelined).");
 }
@@ -869,20 +887,15 @@ void GSState::BackThreadLoop()
 
 	Threading::ThreadHandle handle(Threading::ThreadHandle::GetForCallingThread());
 
-	// A new thread inherits the spawner's affinity mask, and the spawner here is
-	// the MTGS thread — which EnableThreadPinning may have pinned to a single
-	// core (always the case when the back thread is respawned via GSreopen).
-	// Sharing that one core would time-slice front and back and silently
-	// re-serialize the split, so clear to all cores. VMManager owns any future
-	// explicit pinning policy for this thread.
-	handle.SetAffinity(0);
-
-	// Nothing places this thread (VMManager pins the EE, VU and MTGS threads only), so say where
-	// the scheduler first put it. One sample, not a residency figure: it can migrate at any time.
+	// VMManager places this thread next to the MTGS thread (see SetEmuThreadAffinities). The
+	// registration applies that placement now, including replacing the MTGS thread's mask this
+	// thread inherited, which may be a single core and would re-serialize the split.
+	const u64 placed = VMManager::Internal::RegisterGSBackThread(&handle);
 #if defined(__linux__)
-	Console.WriteLn("GS: back thread is unpinned (any core); first ran on CPU %d.", sched_getcpu());
+	Console.WriteLn("GS: back thread starts on CPU mask 0x%llx (0 = any; re-placed when thread affinities are applied); first ran on CPU %d.",
+		static_cast<unsigned long long>(placed), sched_getcpu());
 #else
-	Console.WriteLn("GS: back thread is unpinned (any core).");
+	Console.WriteLn("GS: back thread starts on CPU mask 0x%llx (0 = any; re-placed when thread affinities are applied).", static_cast<unsigned long long>(placed));
 #endif
 
 	// Half the GS work runs here under the split, and the OSD's "GS" figure is the MTGS
@@ -901,8 +914,13 @@ void GSState::BackThreadLoop()
 		{
 			ExecRecordSlot(*slot);
 			m_chan->ring.Pop();
+			m_chan->space.NotifyRetired([this]() { return m_chan->ring.Size(); });
 		}
+		m_chan->space.NotifyIdle();
 	}
+
+	// Before the thread exits, so a placement change never targets a dead thread id.
+	VMManager::Internal::RegisterGSBackThread(nullptr);
 }
 
 void GSState::ExecRecordSlot(const GSBackQueue::RecordSlot& slot)
@@ -4018,6 +4036,8 @@ void GSState::FlushPrim()
 	// Front side: draw serials are front-assigned — the front decides draw order.
 	s_n++;
 
+	const GSBackQueue::DrawPrivRegs priv = CaptureDrawPrivRegs();
+
 	if (m_back_records)
 	{
 		// Hand the live buffers to a pool node: snapshot the buffer structs into
@@ -4054,6 +4074,7 @@ void GSState::FlushPrim()
 		rec.flush_reason = m_state_flush_reason;
 		rec.channel_shuffle_finish = m_channel_shuffle_finish;
 		rec.packed_uv_hack_flag = m_isPackedUV_HackFlag;
+		rec.priv = priv;
 
 		// m_channel_shuffle_finish is written on BOTH sides: the front's
 		// ApplyTEX0 sets it as a one-shot "abort shuffle skip" message, while
@@ -4067,12 +4088,25 @@ void GSState::FlushPrim()
 
 		// The consumer releases the node after the tail runs.
 		PushRecord(GSBackQueue::RecordType::Draw, rec);
+
+		// GSC_IRem clears SCANMSK in the parse environment at the start of the draw, and on a
+		// single object that clear lasts until the game writes SCANMSK again. On the split the
+		// hook clears the back's installed copy, which the next record overwrites, so repeat it
+		// here for every draw that reaches Draw(). Not exact for a draw the hook's own skip
+		// counter lets through (back-side state): a single object leaves the mask set there.
+		if (m_mem_target != this && m_mem_target->DrawClearsScanMask() &&
+			!(m_context->TEST.ZTE && m_context->TEST.ZTST == ZTST_NEVER))
+		{
+			m_env.SCANMSK.MSK = 0;
+			m_prev_env.SCANMSK.MSK = 0;
+		}
 	}
 	else
 	{
 		// Off path: every field the record would carry is captured from live
 		// state and installed back over the same live state, so the round-trip
 		// is an identity — skip it and run the tail directly.
+		m_draw_priv = priv;
 		DrawRecordTail(s_n);
 	}
 
@@ -4142,6 +4176,7 @@ void GSState::ExecDrawRecord(const GSBackQueue::DrawRecord& rec)
 	else
 		m_channel_shuffle_finish = rec.channel_shuffle_finish;
 	m_isPackedUV_HackFlag = rec.packed_uv_hack_flag;
+	m_draw_priv = rec.priv;
 
 	// On a split back object nobody ran FlushDraw here — aim the draw pointers
 	// at the installed draw env exactly as FlushDraw does on the front, and
@@ -4165,6 +4200,17 @@ void GSState::ExecDrawRecord(const GSBackQueue::DrawRecord& rec)
 	}
 }
 
+GSBackQueue::DrawPrivRegs GSState::CaptureDrawPrivRegs()
+{
+	GSBackQueue::DrawPrivRegs priv;
+	priv.dispfb_fbp[0] = m_regs->DISP[0].DISPFB.FBP;
+	priv.dispfb_fbp[1] = m_regs->DISP[1].DISPFB.FBP;
+	priv.display_enabled[0] = m_regs->PMODE.EN1;
+	priv.display_enabled[1] = m_regs->PMODE.EN2;
+	priv.field_render = m_regs->SMODE2.FFMD && isReallyInterlaced();
+	return priv;
+}
+
 // The draw executor's tail: everything from vertex trace to Draw() + perfmon,
 // running against installed (or, on the record-off path, live) state.
 void GSState::DrawRecordTail(u64 draw_serial)
@@ -4174,8 +4220,8 @@ void GSState::DrawRecordTail(u64 draw_serial)
 	// internal frame rate detection based on sprite blits to the display framebuffer
 	{
 		const u32 FRAME_FBP = m_context->FRAME.FBP;
-		if ((m_regs->DISP[0].DISPFB.FBP == FRAME_FBP && m_regs->PMODE.EN1) ||
-			(m_regs->DISP[1].DISPFB.FBP == FRAME_FBP && m_regs->PMODE.EN2))
+		if ((m_draw_priv.dispfb_fbp[0] == FRAME_FBP && m_draw_priv.display_enabled[0]) ||
+			(m_draw_priv.dispfb_fbp[1] == FRAME_FBP && m_draw_priv.display_enabled[1]))
 		{
 			g_perfmon.AddDisplayFramebufferSpriteBlit();
 		}
@@ -4669,6 +4715,23 @@ void GSState::SubmitMove()
 		PushRecord(GSBackQueue::RecordType::Move, rec);
 	else
 		ExecMoveRecord(rec);
+
+	// Split front: Move() sets TRXDIR to 3 on the back. A single object would see that in its
+	// own env, and the IMAGE tag, FIFO read and savestate paths here test it. The ordinary move
+	// always ends at 3; a move hook may take the move and leave 2, and only the back knows
+	// whether it did, so with a hook armed wait for the move and copy its result.
+	if (m_mem_target != this)
+	{
+		if (m_mem_target->HasMoveHook())
+		{
+			DrainBackQueue();
+			m_env.TRXDIR.XDIR = m_mem_target->m_env.TRXDIR.XDIR;
+		}
+		else
+		{
+			m_env.TRXDIR.XDIR = 3;
+		}
+	}
 }
 
 void GSState::ExecMoveRecord(const GSBackQueue::MoveRecord& rec)
@@ -5216,7 +5279,7 @@ void GSState::Transfer(const u8* mem, u32 size)
 						Write(mem, len * 16);
 						break;
 					case 2:
-						Move();
+						SubmitMove();
 						break;
 					default: // 1 and 3
 						// 1 is invalid because downloads can only be done
@@ -6776,7 +6839,7 @@ bool GSState::SpriteUnionCoversDrawRect()
 	return true;
 }
 
-void GSState::CalculatePrimitiveCoversWithoutGaps()
+void GSState::CalculatePrimitiveCoversWithoutGaps(bool union_cover)
 {
 	m_primitive_covers_without_gaps = FullCover;
 	m_primitive_union_covers_rect = false;
@@ -6808,7 +6871,7 @@ void GSState::CalculatePrimitiveCoversWithoutGaps()
 	m_primitive_covers_without_gaps = SpriteDrawWithoutGaps() ? (m_primitive_covers_without_gaps == GapsFound ? SpriteNoGaps : m_primitive_covers_without_gaps) : GapsFound;
 
 	// Asked only where the tiling test refused, and answered onto a flag of its own.
-	if (m_primitive_covers_without_gaps == GapsFound)
+	if (union_cover && m_primitive_covers_without_gaps == GapsFound)
 		m_primitive_union_covers_rect = SpriteUnionCoversDrawRect();
 }
 

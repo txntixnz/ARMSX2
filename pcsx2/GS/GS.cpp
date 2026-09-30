@@ -285,15 +285,19 @@ static void GSApplyCopyRoadBlendingCap(Pcsx2Config::GSOptions& config)
 // reason as the blending cap above: it depends on the device and the download mode, so it is
 // re-derived every time a renderer opens and never written back into the player's settings. Must run before the renderer
 // is constructed, because the renderer's constructor starts the back thread.
-static void GSResolveBackThreadMode(Pcsx2Config::GSOptions& config, GSRendererType renderer)
+static GSBackThreadDecision GSDecideBackThreadFor(const Pcsx2Config::GSOptions& config, GSRendererType renderer)
 {
 	GSBackThreadInputs in;
 	in.requested = config.BackThread;
 	in.hardware_renderer = (renderer != GSRendererType::SW && renderer != GSRendererType::Null);
 	in.vulkan = g_gs_device && g_gs_device->GetRenderAPI() == RenderAPI::Vulkan;
 	in.download_mode = config.HWDownloadMode;
+	return GSDecideBackThread(in);
+}
 
-	const GSBackThreadDecision decision = GSDecideBackThread(in);
+static void GSResolveBackThreadMode(Pcsx2Config::GSOptions& config, GSRendererType renderer)
+{
+	const GSBackThreadDecision decision = GSDecideBackThreadFor(config, renderer);
 	config.BackThreadResolved = decision.on;
 
 	// A request for the split that does not get it is worth a warning. The "GS: back thread"
@@ -416,11 +420,13 @@ static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 
 static void CloseGSRenderer()
 {
-	GSTextureReplacements::Shutdown();
-
 	// The front must go first: its destructor drains the shared channel, and
-	// the back object owns that channel and the pooled arrays.
+	// the back object owns that channel and the pooled arrays. It also has to
+	// precede the texture-replacement shutdown, which frees replacement textures
+	// and clears the maps the back's texture cache reads while it draws.
 	g_gs_front.reset();
+
+	GSTextureReplacements::Shutdown();
 
 	if (g_gs_renderer)
 	{
@@ -439,6 +445,11 @@ static void DrainBackQueueBeforeDeviceMutation()
 {
 	if (g_gs_renderer)
 		g_gs_renderer->DrainBackQueue();
+}
+
+void GSDrainBackQueue()
+{
+	DrainBackQueueBeforeDeviceMutation();
 }
 
 bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_renderer,
@@ -546,6 +557,10 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 
 u32 GSClearShaderCacheOnGSThread()
 {
+	// Stops the pipeline precompile and replaces the pipeline cache the back thread compiles
+	// against.
+	GSDrainBackQueue();
+
 	if (g_gs_device)
 		g_gs_device->PrepareShaderCacheClear();
 	const u32 removed = GSCacheFile::DeleteAll(EmuFolders::Cache);
@@ -816,6 +831,10 @@ void GSThrottlePresentation()
 
 void GSGameChanged(const std::string& serial, u32 crc)
 {
+	// Stops the pipeline precompile and closes the pipeline-key file the back thread records
+	// into, and resets hack state its draws use.
+	DrainBackQueueBeforeDeviceMutation();
+
 	if (g_gs_device)
 		g_gs_device->SetGameIdentity(GSIsHardwareRenderer() ? serial : std::string(), crc);
 
@@ -1138,6 +1157,18 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 	// GSConfig was just replaced wholesale, so the cap has to be re-derived; old_config carries
 	// the previous run's capped value and new_config carries none.
 	GSApplyCopyRoadBlendingCap(GSConfig);
+
+	// The download mode is an input to the back-thread decision, which only runs when a renderer
+	// opens. Reopen the renderer when a change would decide differently: Unsynchronized reads
+	// live GS memory from the EE thread, which a running back thread leaves behind.
+	if (GSConfig.HWDownloadMode != old_config.HWDownloadMode &&
+		GSDecideBackThreadFor(GSConfig, GSCurrentRenderer).on != GSConfig.BackThreadResolved)
+	{
+		if (!GSreopen(false, true, GSCurrentRenderer, &old_config))
+			pxFailRel("Failed to reopen GS renderer for a download mode change");
+
+		return;
+	}
 
 	// Options which aren't using the global struct yet, so we need to recreate all GS objects.
 	if (GSConfig.SWExtraThreads != old_config.SWExtraThreads ||
@@ -1705,7 +1736,11 @@ BEGIN_HOTKEY_LIST(g_gs_hotkeys){"Screenshot", TRANSLATE_NOOP("Hotkeys", "Graphic
 					Host::OSD_QUICK_DURATION);
 
 				EmuConfig.GS.AccurateBlendingUnit = new_blend_mode;
-				MTGS::RunOnGSThread([new_blend_mode]() { GSConfig.AccurateBlendingUnit = new_blend_mode; });
+				MTGS::RunOnGSThread([new_blend_mode]() {
+					// Read by every queued draw; switch between draws, not under them.
+					GSDrainBackQueue();
+					GSConfig.AccurateBlendingUnit = new_blend_mode;
+				});
 			}},
 	{"ToggleTextureDumping", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle Texture Dumping"),
 		[](s32 pressed) {

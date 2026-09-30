@@ -639,6 +639,10 @@ public:
 	GIFPath m_path[4] = {};
 	const GIFRegPRIM* PRIM = nullptr;
 	GSPrivRegSet* m_regs = nullptr;
+	// What the current draw reads of m_regs, captured when it was flushed (FlushPrim). Draw-time
+	// code reads this, never m_regs, because under the split the draw runs after MTGS may have
+	// written the next frame's registers.
+	GSBackQueue::DrawPrivRegs m_draw_priv = {};
 	GSLocalMemory m_mem;
 	GSDrawingEnvironment m_env = {};
 	GSDrawingEnvironment m_prev_env = {};
@@ -847,6 +851,14 @@ public:
 	virtual void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) {}
 	virtual void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) {}
 
+	/// True when this renderer's draws clear SCANMSK in the parse environment (the GSC_IRem hook).
+	/// The split front asks the back, and repeats the clear on its own environment.
+	virtual bool DrawClearsScanMask() const { return false; }
+
+	/// True when a local-to-local move can be taken by a GameDB move hook, which leaves TRXDIR at
+	/// 2 where the ordinary move sets it to 3.
+	virtual bool HasMoveHook() const { return false; }
+
 	virtual void Move();
 
 	// The front/back seam: the front builds a self-contained
@@ -859,6 +871,7 @@ public:
 	void SubmitClutLoad(const GIFRegTEX0& TEX0, const GIFRegTEXCLUT& TEXCLUT);
 	void ExecClutLoadRecord(const GSBackQueue::ClutLoadRecord& rec);
 	void ExecDrawRecord(const GSBackQueue::DrawRecord& rec);
+	GSBackQueue::DrawPrivRegs CaptureDrawPrivRegs();
 	void DrawRecordTail(u64 draw_serial);
 	void SubmitPcrtcSync();
 	void ExecPcrtcSyncRecord(const GSBackQueue::PcrtcSyncRecord& rec);
@@ -946,7 +959,10 @@ public:
 				m_chan->sema.NotifyOfWork();
 				break;
 			}
-			std::this_thread::yield(); // ring full — backpressure
+			// Ring full: sleep until the back has retired a batch.
+			m_chan->space.Wait([this]() {
+				return GSBackQueue::RecordRing::Capacity() - m_chan->ring.Size() >= GSBackQueue::Channel::kRingRefill;
+			});
 		}
 	}
 
@@ -1003,7 +1019,10 @@ public:
 	PRIM_OVERLAP PrimitiveOverlap(bool save_drawlist = false);
 	bool SpriteDrawWithoutGaps();
 	bool SpriteUnionCoversDrawRect();
-	void CalculatePrimitiveCoversWithoutGaps();
+	/// Sets m_primitive_covers_without_gaps, and m_primitive_union_covers_rect unless `union_cover`
+	/// is false: that flag has one reader on the GPU road, and the sprite-union test behind it is
+	/// the costly part for a draw of many sprites.
+	void CalculatePrimitiveCoversWithoutGaps(bool union_cover = true);
 	GIFRegTEX0 GetTex0Layer(u32 lod);
 	template <u32 primclass>
 	void RewriteVerticesIfLargeSTImpl(const GSVector4& large_val, bool check_clamp_mode);
