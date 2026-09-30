@@ -448,19 +448,36 @@ object ControllerMappings {
     // PS2 Multitap master switch. OFF (default) = classic 2-player co-op. ON = up to 8
     // controllers routed to the 2 ports x 4 slots. Extra pads (slots 2-7) reuse the P1
     // button mapping. Also drives PadRouter's routing gate.
+    //
+    // Scoped like the rest of the Controls tab: a per-game value shadows the global one for that
+    // game only. It used to be one global switch, so turning it on in a game's own settings turned
+    // it on for every game.
     private const val KEY_MULTITAP = "pad.multitap.enabled"
-    fun multitapEnabled(): Boolean = MainActivityRuntime.prefs.getBoolean(KEY_MULTITAP, false)
-    fun setMultitapEnabled(on: Boolean) {
-        MainActivityRuntime.prefs.edit { putBoolean(KEY_MULTITAP, on) }
-        com.armsx2.input.PadRouter.multitapEnabled = on
-        if (MainActivityRuntime.nativeReady.value) {
+    /** Runtime (per-game aware): the running game's own value, else global. Read at boot. */
+    fun multitapEnabled(): Boolean = resolveBoolean(KEY_MULTITAP, false)
+    /** Scope-explicit, for the Controls tab. */
+    fun multitapEnabledScope(serial: String?): Boolean = scopedBoolean(KEY_MULTITAP, serial, false)
+    fun setMultitapEnabled(on: Boolean, serial: String? = null) {
+        val before = multitapEnabled()
+        MainActivityRuntime.prefs.edit { putBoolean(scopedKey(KEY_MULTITAP, serial), on) }
+        // Armed live only when the running game's own answer changed: a global edit under a game
+        // with a value of its own, or another game's value, leaves the running one alone.
+        val after = multitapEnabled()
+        com.armsx2.input.PadRouter.multitapEnabled = after
+        if (after != before && MainActivityRuntime.nativeReady.value) {
             kotlin.concurrent.thread(name = "armsx2-multitap") {
                 runCatching {
-                    kr.co.iefriends.pcsx2.NativeApp.setMultitap(0, on)
-                    kr.co.iefriends.pcsx2.NativeApp.setMultitap(1, on)
+                    kr.co.iefriends.pcsx2.NativeApp.setMultitap(0, after)
+                    kr.co.iefriends.pcsx2.NativeApp.setMultitap(1, after)
                 }
             }
         }
+    }
+    /** For the in-game switches (quick menu, Controllers screen): they show the running game's
+     *  answer, so they edit the game's own value when it has one, and the global one otherwise. */
+    fun setMultitapEnabledForRunningGame(on: Boolean) {
+        val serial = runtimeSerial()?.takeIf { MainActivityRuntime.prefs.contains(gameKey(it, KEY_MULTITAP)) }
+        setMultitapEnabled(on, serial)
     }
 
     // ---- Gyroscope / motion controls (per-game aware) ---------------------
@@ -485,6 +502,15 @@ object ControllerMappings {
     const val GYRO_STICK_RIGHT = 0
     const val GYRO_STICK_LEFT = 1
     private const val KEY_GYRO_AIM_STICK = "pad.gyro.aimStick"
+    // Which stick Steer mode drives, same values; Left by default, as it always was (#592).
+    private const val KEY_GYRO_STEER_STICK = "pad.gyro.steerStick"
+    // Separate X and Y sensitivity (#592). Off: one slider sets both, and Steer mode is X only,
+    // as it always was. On: each axis has its own 0-300%, where 0 turns that axis off, and Steer
+    // mode also reads tipping the device forward and back as Y. The two default to the single
+    // slider's value, so switching this on starts from the same feel.
+    private const val KEY_GYRO_SPLIT = "pad.gyro.splitAxes"
+    private const val KEY_GYRO_SENS_X = "pad.gyro.sensitivityX"
+    private const val KEY_GYRO_SENS_Y = "pad.gyro.sensitivityY"
 
     // Runtime (per-game aware): read by the sensor lifecycle while a game runs.
     fun gyroMode(): Int = resolveInt(KEY_GYRO_MODE, GYRO_OFF).coerceIn(0, 2)
@@ -493,6 +519,10 @@ object ControllerMappings {
     fun gyroInvertX(): Boolean = resolveBoolean(KEY_GYRO_INVX, false)
     fun gyroInvertY(): Boolean = resolveBoolean(KEY_GYRO_INVY, false)
     fun gyroAimStick(): Int = resolveInt(KEY_GYRO_AIM_STICK, GYRO_STICK_RIGHT).coerceIn(0, 1)
+    fun gyroSteerStick(): Int = resolveInt(KEY_GYRO_STEER_STICK, GYRO_STICK_LEFT).coerceIn(0, 1)
+    fun gyroSplitAxes(): Boolean = resolveBoolean(KEY_GYRO_SPLIT, false)
+    fun gyroSensitivityX(): Int = resolveInt(KEY_GYRO_SENS_X, gyroSensitivity()).coerceIn(0, 300)
+    fun gyroSensitivityY(): Int = resolveInt(KEY_GYRO_SENS_Y, gyroSensitivity()).coerceIn(0, 300)
 
     // Scope-explicit (Pad UI): read the global tier (serial=null) or a per-game tier.
     fun gyroModeScope(serial: String?): Int = scopedInt(KEY_GYRO_MODE, serial, GYRO_OFF).coerceIn(0, 2)
@@ -501,6 +531,12 @@ object ControllerMappings {
     fun gyroInvertXScope(serial: String?): Boolean = scopedBoolean(KEY_GYRO_INVX, serial, false)
     fun gyroInvertYScope(serial: String?): Boolean = scopedBoolean(KEY_GYRO_INVY, serial, false)
     fun gyroAimStickScope(serial: String?): Int = scopedInt(KEY_GYRO_AIM_STICK, serial, GYRO_STICK_RIGHT).coerceIn(0, 1)
+    fun gyroSteerStickScope(serial: String?): Int = scopedInt(KEY_GYRO_STEER_STICK, serial, GYRO_STICK_LEFT).coerceIn(0, 1)
+    fun gyroSplitAxesScope(serial: String?): Boolean = scopedBoolean(KEY_GYRO_SPLIT, serial, false)
+    fun gyroSensitivityXScope(serial: String?): Int =
+        scopedInt(KEY_GYRO_SENS_X, serial, gyroSensitivityScope(serial)).coerceIn(0, 300)
+    fun gyroSensitivityYScope(serial: String?): Int =
+        scopedInt(KEY_GYRO_SENS_Y, serial, gyroSensitivityScope(serial)).coerceIn(0, 300)
 
     fun setGyroMode(value: Int, serial: String? = null) =
         MainActivityRuntime.prefs.edit { putInt(scopedKey(KEY_GYRO_MODE, serial), value) }
@@ -514,6 +550,14 @@ object ControllerMappings {
         MainActivityRuntime.prefs.edit { putBoolean(scopedKey(KEY_GYRO_INVY, serial), on) }
     fun setGyroAimStick(value: Int, serial: String? = null) =
         MainActivityRuntime.prefs.edit { putInt(scopedKey(KEY_GYRO_AIM_STICK, serial), value) }
+    fun setGyroSteerStick(value: Int, serial: String? = null) =
+        MainActivityRuntime.prefs.edit { putInt(scopedKey(KEY_GYRO_STEER_STICK, serial), value) }
+    fun setGyroSplitAxes(on: Boolean, serial: String? = null) =
+        MainActivityRuntime.prefs.edit { putBoolean(scopedKey(KEY_GYRO_SPLIT, serial), on) }
+    fun setGyroSensitivityX(value: Int, serial: String? = null) =
+        MainActivityRuntime.prefs.edit { putInt(scopedKey(KEY_GYRO_SENS_X, serial), value) }
+    fun setGyroSensitivityY(value: Int, serial: String? = null) =
+        MainActivityRuntime.prefs.edit { putInt(scopedKey(KEY_GYRO_SENS_Y, serial), value) }
 
     // ---- Custom per-direction stick→button binding (StickMode.CUSTOM) ----
 
@@ -1142,6 +1186,22 @@ object ControllerMappings {
         // the panel goes to the monitor, and turning it off meant unplugging or digging into App
         // settings (SoraNo, on a Thor). Appended last for the persisted-by-ordinal reason above.
         SECOND_SCREEN("pad.secondscreen.keycode", "Second Screen Panel (toggle)"),
+        // The pressure modifier as a toggle (#304): press once for soft presses, again for full.
+        // The hold binding needs a finger on its button for the whole gesture, and a handheld with
+        // no spare button has nothing to give it; bound to a two-button combo, this one costs no
+        // button at all. Appended last for the persisted-by-ordinal reason above.
+        PRESSURE_MOD_TOGGLE("pad.pressuremodtoggle.keycode", "Pressure Modifier (toggle)"),
+    }
+
+    /**
+     * The hotkeys in the order the screens list them. The enum's order is persisted (ordinals,
+     * append only), so a later addition lands at the end even when it belongs beside an older
+     * one: the Pressure Modifier toggle sat far below the hold binding it pairs with.
+     */
+    val hotkeysInDisplayOrder: List<SysHotkey> by lazy {
+        val out = SysHotkey.entries.filter { it != SysHotkey.PRESSURE_MOD_TOGGLE }.toMutableList()
+        out.add(out.indexOf(SysHotkey.PRESSURE_MOD) + 1, SysHotkey.PRESSURE_MOD_TOGGLE)
+        out
     }
 
     // A hotkey is either a single button or a two-button combo. The main key is

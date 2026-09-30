@@ -127,6 +127,7 @@ private val BASE_SEARCH_INDEX: List<SettingsSearchEntry> = listOf(
     // Missing from the index entirely, so nobody could search their way to it -- which is
     // exactly what #629 reported ("If one exists, I can't seem to find it").
     SettingsSearchEntry("overlay.toggle.fastForwardPopups", true, SettingsCategory.Graphics),
+    SettingsSearchEntry("overlay.toggle.freeSoftwareNotice", true, SettingsCategory.Graphics),
     SettingsSearchEntry("renderer.upscaler.label", true, SettingsCategory.Graphics, listOf("renderer.section.displayEffects")),
     SettingsSearchEntry("renderer.cas.label", true, SettingsCategory.Graphics, listOf("renderer.section.displayEffects")),
     SettingsSearchEntry("renderer.blendingAccuracy.label", true, SettingsCategory.Graphics, listOf("renderer.section.blendingAdvanced")),
@@ -155,6 +156,8 @@ private val BASE_SEARCH_INDEX: List<SettingsSearchEntry> = listOf(
     SettingsSearchEntry("pad.rumble.label", true, SettingsCategory.Controls, listOf("pad.section.playerRumble")),
     SettingsSearchEntry("pad.gyro.mode.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
     SettingsSearchEntry("pad.gyro.sensitivity.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
+    SettingsSearchEntry("pad.gyro.splitAxes.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
+    SettingsSearchEntry("pad.gyro.steerStick.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
     SettingsSearchEntry("pad.gyro.smoothing.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
     SettingsSearchEntry("pad.gyro.invertX.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
     SettingsSearchEntry("pad.gyro.invertY.label", true, SettingsCategory.Controls, listOf("pad.gyro.section")),
@@ -209,6 +212,7 @@ private val BASE_SEARCH_INDEX: List<SettingsSearchEntry> = listOf(
     SettingsSearchEntry("overlay.toggle.controlInputs", true, SettingsCategory.OnScreen),
     SettingsSearchEntry("overlay.toggle.onScreenNotifications", true, SettingsCategory.OnScreen),
     SettingsSearchEntry("overlay.toggle.fastForwardPopups", true, SettingsCategory.OnScreen),
+    SettingsSearchEntry("overlay.toggle.freeSoftwareNotice", true, SettingsCategory.OnScreen),
     SettingsSearchEntry("overlay.osdSize.label", true, SettingsCategory.OnScreen),
     SettingsSearchEntry("overlay.osdColor.label", true, SettingsCategory.OnScreen),
     SettingsSearchEntry("overlay.osdPosition.label", true, SettingsCategory.OnScreen),

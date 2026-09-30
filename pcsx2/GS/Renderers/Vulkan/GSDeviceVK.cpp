@@ -45,6 +45,11 @@ namespace
 #include "GS/Renderers/Common/GSFramebufferFetchPolicy.h"
 #include "GS/Renderers/Common/GSMeasurementOverrides.h"
 #include "GS/Renderers/Common/GSSelfReadRoadPolicy.h"
+#include "GS/DriverReport/GSDriverReport.h"
+#include "GS/DriverReport/GSDriverReportClassify.h"
+#include "GS/DriverReport/GSDriverReportProfile.h"
+#include "GS/DriverReport/GSDriverReportVulkan.h"
+#include "GS/Renderers/Common/GSStreamRingMemoryPolicy.h"
 
 #include "BuildVersion.h"
 #include "Config.h"
@@ -170,6 +175,9 @@ static std::mutex s_instance_mutex;
 // empty) list so the existing required-extension scan loops stay valid.
 static constexpr std::array<const char*, 0> s_required_device_extensions = {};
 
+// The instance extensions the last CreateVulkanInstance enabled, for the driver report.
+static std::vector<std::string> s_enabled_instance_extensions;
+
 GSDeviceVK::GSDeviceVK()
 {
 #ifdef ENABLE_OGL_DEBUG
@@ -230,6 +238,7 @@ VkInstance GSDeviceVK::CreateVulkanInstance(const WindowInfo& wi, OptionalExtens
 		return nullptr;
 	}
 
+	s_enabled_instance_extensions.assign(enabled_extensions.begin(), enabled_extensions.end());
 	return instance;
 }
 
@@ -486,7 +495,8 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 		m_physical_device, nullptr, &extension_count, available_extension_list.data());
 	pxAssert(res == VK_SUCCESS);
 
-	auto SupportsExtension = [&available_extension_list, extension_list](const char* name, bool required) {
+	m_missing_device_extensions.clear();
+	auto SupportsExtension = [this, &available_extension_list, extension_list](const char* name, bool required) {
 		if (std::find_if(available_extension_list.begin(), available_extension_list.end(),
 				[name](const VkExtensionProperties& properties) { return !strcmp(name, properties.extensionName); }) !=
 			available_extension_list.end())
@@ -504,6 +514,9 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 		if (required)
 			Console.Error("VK: Missing required extension %s.", name);
 
+		if (std::find(m_missing_device_extensions.begin(), m_missing_device_extensions.end(), name) ==
+			m_missing_device_extensions.end())
+			m_missing_device_extensions.emplace_back(name);
 		return false;
 	};
 
@@ -590,6 +603,10 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 	// model is 1.2 and nullDescriptor never became core at all — so both come in as extensions.
 	m_optional_extensions.vk_khr_vulkan_memory_model = SupportsExtension(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, false);
 	m_optional_extensions.vk_ext_robustness2_null_descriptor = SupportsExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, false);
+	// LSFG's half-precision shaders, only while that option is on (the rest of the renderer has no
+	// fp16), so it takes effect from the next device, which is the next game.
+	m_optional_extensions.vk_khr_shader_float16_int8 =
+		GSConfig.LsfgFp16 && SupportsExtension(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, false);
 
 	return true;
 }
@@ -751,6 +768,7 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	ExtensionList enabled_extensions;
 	if (!SelectDeviceExtensions(&enabled_extensions, surface != VK_NULL_HANDLE))
 		return false;
+	m_enabled_device_extensions.assign(enabled_extensions.begin(), enabled_extensions.end());
 
 	device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
 	device_info.ppEnabledExtensionNames = enabled_extensions.data();
@@ -789,6 +807,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
 	VkPhysicalDeviceRobustness2FeaturesEXT robustness2_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+	VkPhysicalDeviceShaderFloat16Int8FeaturesKHR float16_int8_feature = {
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR};
 	VkPhysicalDeviceFaultFeaturesEXT device_fault_feature = {
 		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
 
@@ -820,6 +840,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
 		VkPhysicalDeviceRobustness2FeaturesEXT probe_r2 = {
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+		VkPhysicalDeviceShaderFloat16Int8FeaturesKHR probe_f16 = {
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR};
 		VkPhysicalDeviceFaultFeaturesEXT probe_fault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
 
 		// Only chain what we would actually enable: querying a struct whose extension is absent is
@@ -841,6 +863,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			Vulkan::AddPointerToChain(&probe, &probe_vmm);
 		if (m_optional_extensions.vk_ext_robustness2_null_descriptor)
 			Vulkan::AddPointerToChain(&probe, &probe_r2);
+		if (m_optional_extensions.vk_khr_shader_float16_int8)
+			Vulkan::AddPointerToChain(&probe, &probe_f16);
 		if (m_optional_extensions.vk_ext_device_fault)
 			Vulkan::AddPointerToChain(&probe, &probe_fault);
 		vkGetPhysicalDeviceFeatures2(m_physical_device, &probe);
@@ -885,6 +909,8 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 			m_optional_extensions.vk_ext_robustness2_null_descriptor, probe_r2.nullDescriptor == VK_TRUE);
 		m_optional_extensions.vk_ext_device_fault = keep("VK_EXT_device_fault",
 			m_optional_extensions.vk_ext_device_fault, probe_fault.deviceFault == VK_TRUE);
+		m_optional_extensions.vk_khr_shader_float16_int8 = keep("VK_KHR_shader_float16_int8 (shaderFloat16)",
+			m_optional_extensions.vk_khr_shader_float16_int8, probe_f16.shaderFloat16 == VK_TRUE);
 
 		// Depth ROAA is an optional sub-feature: a driver can offer the extension and colour
 		// access yet not depth.
@@ -945,6 +971,12 @@ bool GSDeviceVK::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer
 	{
 		device_fault_feature.deviceFault = VK_TRUE;
 		Vulkan::AddPointerToChain(&device_info, &device_fault_feature);
+	}
+	if (m_optional_extensions.vk_khr_shader_float16_int8)
+	{
+		// shaderFloat16 only; shaderInt8 is nothing we use.
+		float16_int8_feature.shaderFloat16 = VK_TRUE;
+		Vulkan::AddPointerToChain(&device_info, &float16_int8_feature);
 	}
 
 	VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
@@ -3500,6 +3532,38 @@ void GSDeviceVK::EndPresent()
 	else if (GSLsfg::IsActive())
 		GSLsfg::Shutdown();
 
+	// Frame generation on the game's own image instead of the finished screen, when the present
+	// was only the plain scaled blit it can repeat for each generated frame (it draws the ImGui
+	// overlay onto them afresh as well). Here, after Initialize/Shutdown, which may replace the
+	// image copied into, and in this frame's command buffer, where the game texture's layout is
+	// tracked.
+	if (GSLsfg::IsActive())
+	{
+		GSTextureVK* const current = static_cast<GSTextureVK*>(GetCurrent());
+		if (m_present_has_new_frame && m_present_geometry.plain && current)
+		{
+			current->TransitionToLayout(cmdbuffer, GSTextureVK::Layout::TransferSrc);
+			GSLsfg::GameFrame frame;
+			frame.image = current->GetImage();
+			const GSVector4i& src = m_present_geometry.src_rect;
+			const GSVector4& draw = m_present_geometry.draw_rect;
+			frame.src[0] = src.x;
+			frame.src[1] = src.y;
+			frame.src[2] = src.z;
+			frame.src[3] = src.w;
+			frame.draw[0] = draw.x;
+			frame.draw[1] = draw.y;
+			frame.draw[2] = draw.z;
+			frame.draw[3] = draw.w;
+			frame.linear = m_present_geometry.linear;
+			GSLsfg::CaptureGameFrame(cmdbuffer, &frame);
+		}
+		else
+		{
+			GSLsfg::CaptureGameFrame(cmdbuffer, nullptr);
+		}
+	}
+
 	SubmitCommandBuffer(m_swap_chain.get());
 	MoveToNextCommandBuffer();
 
@@ -3788,6 +3852,8 @@ bool GSDeviceVK::CheckFeatures()
 	const bool declare_depth_loop = ResolveDepthFeedback(road);
 	ResolveStreamRingMemory();
 	LogResolvedFeatures(road, declare_depth_loop);
+	m_report_self_read_road = GSSelfReadRoadName(road);
+	m_report_declare_depth_loop = declare_depth_loop;
 	return CheckFormatSupport();
 }
 
@@ -3808,13 +3874,20 @@ void GSDeviceVK::PublishGPUProfile()
 	SetMobileGPUIdentity(mobile_profile.gpu);
 	SetMobileGSTuning(mobile_profile.gs_tuning);
 
-	// Hand the resolved architecture to frame generation, which needs Adreno 7xx or newer. Done
-	// here rather than asked for on demand so the settings screen can still say WHY the row is
-	// unavailable after the game stops and the device is gone.
+	// Hand the resolved architecture to frame generation, which needs Adreno 7xx or newer, or a
+	// 6xx on Turnip. Done here rather than asked for on demand so the settings screen can still
+	// say WHY the row is unavailable after the game stops and the device is gone.
 	{
 		u32 adreno_generation = 0;
 		switch (mobile_profile.gpu.architecture)
 		{
+			// Adreno 6xx only under Turnip, which is where frame generation already runs on these
+			// GPUs (Winlator, GameHub). Nothing shows the Qualcomm driver on 6xx doing it (#626).
+			// Either way Initialize() still checks the features the shaders need.
+			case MobileGpuArchitecture::Adreno6xx:
+				if (mobile_profile.driver.driver == MobileGpuDriver::MesaTurnip)
+					adreno_generation = 6;
+				break;
 			case MobileGpuArchitecture::Adreno7xx: adreno_generation = 7; break;
 			case MobileGpuArchitecture::Adreno8xx: adreno_generation = 8; break;
 			// Adreno X (X1-85 and up) postdates 7xx and carries the same feature set.
@@ -9794,4 +9867,100 @@ void GSDeviceVK::SendHWDraw(const GSHWDrawConfig& config, GSTextureVK* draw_rt, 
 
 	if (config.ps.HasColorROV() || config.ps.HasDepthROV())
 		g_perfmon.Put(GSPerfMon::DrawCallsROV, 1);
+}
+
+void GSDeviceVK::CollectDriverReport(GSDriverReport::BackendReport& out) const
+{
+	using namespace GSDriverReport;
+
+	// The base object is replaced below by one carrying the whole resolver result.
+	GSDevice::CollectDriverReport(out);
+
+	out.has_served_facts = true;
+	out.vendor_id = m_device_properties.vendorID;
+	out.device_name = m_device_properties.deviceName;
+	if (m_optional_extensions.vk_khr_driver_properties)
+	{
+		out.driver_id = static_cast<u32>(m_device_driver_properties.driverID);
+		out.driver_name = m_device_driver_properties.driverName;
+		out.driver_info = m_device_driver_properties.driverInfo;
+	}
+
+	VulkanLiveFacts live;
+	live.enabled_instance_extensions = s_enabled_instance_extensions;
+	live.enabled_device_extensions = m_enabled_device_extensions;
+	live.missing_device_extensions = m_missing_device_extensions;
+	live.instance_api_version = VK_API_VERSION_1_1;
+	{
+		JsonWriter vw;
+		WriteVulkanInstance(vw, out.steps, "vulkan", m_instance, m_physical_device, &live, nullptr);
+		out.vulkan_json = vw.TakeString();
+	}
+
+	JsonWriter w;
+	w.BeginObject();
+	w.KeyString("device_name", m_name);
+	w.KeyUInt("max_texture_size", m_max_texture_size);
+	w.KeyString("self_read_road", m_report_self_read_road);
+
+	w.Key("roads");
+	w.BeginObject();
+	w.KeyBool("texture_barrier", m_features.texture_barrier);
+	w.KeyBool("framebuffer_fetch_in_tile", m_features.framebuffer_fetch);
+	w.KeyBool("feedback_loop_layout", UseFeedbackLoopLayout());
+	w.KeyBool("declared_loop_orders_overlap", m_features.declared_feedback_loop_orders_overlap);
+	w.KeyString("feedback_loop_declaration", m_declare_loop_per_draw ? "dynamic per draw" : "pipeline create flag");
+	w.KeyBool("depth_loop_declared", m_report_declare_depth_loop);
+	w.KeyBool("depth_feedback", m_features.depth_feedback);
+	w.KeyBool("push_descriptors", m_use_push_descriptors);
+	w.KeyString("stream_rings", GSStreamRingMemoryRoadName(m_stream_ring_memory.road));
+	w.KeyUInt("stream_ring_memory_type", m_stream_ring_memory.type_index);
+	w.KeyBool("gpu_timing_supported", m_gpu_timing_supported);
+	w.KeyBool("present_spinning_supported", m_spinning_supported);
+	w.KeyBool("measurement_overrides_set", g_gs_measurement_overrides.Any());
+	w.EndObject();
+
+	w.Key("features");
+	WriteFeatureSupport(w, m_features);
+
+	w.Key("profile");
+	{
+		ServedDriverFacts facts;
+		facts.vendor_id = out.vendor_id;
+		facts.driver_id = out.driver_id;
+		facts.driver_name = out.driver_name;
+		facts.driver_info = out.driver_info;
+		facts.device_name = out.device_name;
+		WriteGpuProfile(w, m_gpu_profile, &m_device_rules, ClassifyServedDriver(facts).answered);
+	}
+
+	w.Key("optional_extensions");
+	w.BeginObject();
+#define OPT(name) w.KeyBool(#name, m_optional_extensions.name)
+	OPT(vk_ext_provoking_vertex);
+	OPT(vk_ext_memory_budget);
+	OPT(vk_ext_calibrated_timestamps);
+	OPT(vk_ext_rasterization_order_attachment_access);
+	OPT(vk_ext_roaa_depth);
+	OPT(vk_ext_full_screen_exclusive);
+	OPT(vk_ext_line_rasterization);
+	OPT(vk_swapchain_maintenance1);
+	OPT(vk_swapchain_maintenance1_is_khr);
+	OPT(vk_khr_push_descriptor);
+	OPT(vk_khr_driver_properties);
+	OPT(vk_khr_shader_non_semantic_info);
+	OPT(vk_ext_attachment_feedback_loop_layout);
+	OPT(vk_ext_attachment_feedback_loop_dynamic_state);
+	OPT(vk_ext_fragment_shader_interlock);
+	OPT(vk_khr_vulkan_memory_model);
+	OPT(vk_ext_robustness2_null_descriptor);
+	OPT(vk_ext_device_fault);
+#undef OPT
+	w.EndObject();
+
+	w.Key("enabled_core_features");
+	WriteVulkanCoreFeatures(w, m_device_features);
+
+	w.EndObject();
+	out.backend_json = w.TakeString();
 }

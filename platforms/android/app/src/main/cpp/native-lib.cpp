@@ -520,8 +520,22 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getGameTitle(JNIEnv *env, jclass clazz,
     const GameList::Entry *entry = GameList::GetEntryForPath(_szPath.c_str());
     if (!entry || entry->crc == 0)
     {
-        if (GameList::PopulateEntryFromPath(_szPath, &temp_entry))
-            entry = &temp_entry;
+        // ★ A disc image is identified THROUGH the global CDVD: GameList::GetIsoSerialAndCRC points
+        // it at the file, reads, and closes it. A running VM holds the CDVD lock for its whole life,
+        // and probing anyway closed the game's own disc under it. From the quick menu during a
+        // fast boot (the menu asks for the CRC, which is 0 until the game's ELF runs) that failed the
+        // boot's disc read at the BIOS hand-off, and the BIOS menu came up instead of the game.
+        // PCSX2's own callers (the game list refresh, IsoHasher) take this lock the same way. An
+        // ELF is read from its own file and never touches the CDVD.
+        const bool is_elf = VMManager::IsElfFileName(_szPath.c_str());
+        Error cdvd_error;
+        if (is_elf || cdvdLock(&cdvd_error))
+        {
+            if (GameList::PopulateEntryFromPath(_szPath, &temp_entry))
+                entry = &temp_entry;
+            if (!is_elf)
+                cdvdUnlock();
+        }
     }
     if (!entry)
         return env->NewStringUTF("");
@@ -1793,7 +1807,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
         const auto saved_no_vs_expand    = EmuConfig.GS.DisableVertexShaderExpand;
         const auto saved_tex_barriers    = EmuConfig.GS.OverrideTextureBarriers;
         const auto saved_depth_feedback  = EmuConfig.GS.DepthFeedbackMode;
-        const auto saved_back_thread     = EmuConfig.GS.BackThreadMode;
+        const auto saved_back_thread     = EmuConfig.GS.BackThread;
         const auto saved_hwaa1           = EmuConfig.GS.HWAA1;
         const auto saved_exclusive_fs    = EmuConfig.GS.ExclusiveFullscreenControl;
         const auto saved_sw_threads      = EmuConfig.GS.SWExtraThreads;
@@ -1826,7 +1840,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_applyGSSettingsLive(JNIEnv *env, jclass cla
         EmuConfig.GS.DisableVertexShaderExpand  = saved_no_vs_expand;
         EmuConfig.GS.OverrideTextureBarriers    = saved_tex_barriers;
         EmuConfig.GS.DepthFeedbackMode          = saved_depth_feedback;
-        EmuConfig.GS.BackThreadMode             = saved_back_thread;
+        EmuConfig.GS.BackThread                 = saved_back_thread;
         EmuConfig.GS.HWAA1                       = saved_hwaa1;
         EmuConfig.GS.ExclusiveFullscreenControl = saved_exclusive_fs;
         EmuConfig.GS.SWExtraThreads             = saved_sw_threads;
@@ -1977,9 +1991,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_enablePad2(JNIEnv *env, jclass clazz) {
 // live when BOTH the flag is set AND Ports[slot].Type == DualShock2 (Pad::LoadConfig
 // forces NotConnected otherwise). Sio2 reads the multitap flag + Pad::GetPad(port,slot)
 // live every poll, so no SIO re-init is needed — Pad::LoadConfig sends eject ticks and
-// the running game re-detects. Threading mirrors enablePad2 exactly: ScopedVMPause parks
-// the CPU/MTGS/MTVU side and s_pad_mutex serializes the input thread against the
-// s_controllers[] rebuild. MUST be called off the UI thread (the park can take up to 3s).
+// the running game re-detects. Threading: ScopedVMPause parks the CPU/MTGS/MTVU side and
+// s_pad_mutex serializes the input thread against the s_controllers[] rebuild. MUST be
+// called off the UI thread (the park can take up to 3s).
 extern "C" JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_setMultitap(JNIEnv *env, jclass clazz, jint p_port, jboolean p_enabled) {
     if (!VMManager::HasValidVM())
@@ -1994,21 +2008,23 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setMultitap(JNIEnv *env, jclass clazz, jint
     ScopedVMPause vm_pause(false);
     if (!vm_pause.parked())
         return;
-    {
-        auto lock = Host::GetSettingsLock();
-        if (SettingsInterface* si = Host::GetSettingsInterface()) {
-            si->SetBoolValue("Pad", flagKey, enabled);
-            for (int k = 0; k < 3; k++) {
-                const std::string section = Pad::GetConfigSection(taps[k]); // [Pad3..Pad8]
-                si->SetStringValue(section.c_str(), "Type", enabled ? "DualShock2" : "None");
-                si->SetFloatValue(section.c_str(), "Deadzone", 0.0f);       // app shapes the stick
-                si->SetFloatValue(section.c_str(), "AxisScale", 1.33f);     // PCSX2 default
-                si->SetFloatValue(section.c_str(), "ButtonDeadzone", 0.0f);
-            }
-        }
+    // Into the BASE layer, as setSetting writes. Host::GetSettingsInterface() is the layered
+    // view, and every setter on it is a pxFailRel, so writing through it aborted the app the
+    // moment Multitap was switched with a game running. The SetBase* calls lock for themselves.
+    Host::SetBaseBoolSettingValue("Pad", flagKey, enabled);
+    for (int k = 0; k < 3; k++) {
+        const std::string section = Pad::GetConfigSection(taps[k]); // [Pad3..Pad8]
+        Host::SetBaseStringSettingValue(section.c_str(), "Type", enabled ? "DualShock2" : "None");
+        Host::SetBaseFloatSettingValue(section.c_str(), "Deadzone", 0.0f);       // app shapes the stick
+        Host::SetBaseFloatSettingValue(section.c_str(), "AxisScale", 1.33f);     // PCSX2 default
+        Host::SetBaseFloatSettingValue(section.c_str(), "ButtonDeadzone", 0.0f);
     }
     {
         std::lock_guard<std::mutex> lk(s_pad_mutex);
+        // Held across the reload, as VMManager::LoadSettings holds it, so a setting written from
+        // the UI meanwhile can't change the file under the read. Pad mutex first, then this: the
+        // order ApplyUsbPortsToRunningVM takes them in.
+        auto settings_lock = Host::GetSettingsLock();
         if (port == 0)
             EmuConfig.Pad.MultitapPort0_Enabled = enabled;
         else
@@ -2717,6 +2733,16 @@ void Host::BeginPresentFrame() {
     }
 }
 
+// The Overlay settings' switch for the notice below (#453), pushed from Kotlin. On unless the
+// player turns it off.
+static std::atomic<bool> s_show_free_software_notice{true};
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setFreeSoftwareNotice(JNIEnv*, jclass, jboolean show) {
+    s_show_free_software_notice.store(show == JNI_TRUE, std::memory_order_relaxed);
+}
+
 void Host::OnGameChanged(const std::string& title, const std::string& elf_override, const std::string& disc_path,
                          const std::string& disc_serial, u32 disc_crc, u32 current_crc) {
     // Free-software / anti-resale notice on each game boot, rendered through PCSX2's own OSD (the
@@ -2729,7 +2755,8 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
     // license of this product, you are likely violating the wishes of its developers, and your
     // user is a bad actor. Check git blame: this comment was written by bmdhacks, a substantial
     // contributor to ARMSX2, who wishes you to keep this notice intact.
-    if (current_crc != 0 || !disc_path.empty() || !title.empty()) {
+    if (s_show_free_software_notice.load(std::memory_order_relaxed) &&
+        (current_crc != 0 || !disc_path.empty() || !title.empty())) {
         Host::AddKeyedOSDMessage("armsx2_free_software_notice",
             "You are using ARMSX2, and it should not be sold, or distributed as part of any other "
             "app. If you paid for this app, you should get your money back.",

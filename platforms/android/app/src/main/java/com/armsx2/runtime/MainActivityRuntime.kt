@@ -951,6 +951,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 if (ctx != null) pickedId?.let { id ->
                     com.armsx2.CustomDriver.listInstalled(ctx).firstOrNull { it.id == id }
                 } else null
+            // Turnip options (#719) go into the environment before the device is created.
+            com.armsx2.CustomDriver.applyDriverEnv()
             if (ctx != null) com.armsx2.CustomDriver.applyToNative(ctx, picked)
             when (renderer.value) {
                 "vulkan" -> NativeApp.renderVulkan()
@@ -972,8 +974,9 @@ open class MainActivityRuntime : ComponentActivity() {
             // already pushed [USB1] Type + the live attach (usbApplyPorts).
             usbKeyboardActive = resolved.system.usbKeyboard
             // A Cal armed in the previous game must not turn this one's first shot into a
-            // calibration shot.
+            // calibration shot, nor a pressure modifier toggled on (#304) soften its first press.
             com.armsx2.input.Lightgun.calibrateNext.value = false
+            com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = false
 
             // Neutralize the NATIVE pad analog deadzone before the VM loads [Pad1].
             // A stale [Pad1]/Deadzone in an existing config (from the old, non-saving
@@ -1016,7 +1019,11 @@ open class MainActivityRuntime : ComponentActivity() {
                 // 8 slots on for a complete pair of taps; idle slots are harmless (games
                 // ignore unused pads). Unconditional-when-ON so a pad joining after boot
                 // still lands on a live slot; the Pad-tab toggle covers mid-session enable.
-                if (ControllerMappings.multitapEnabled()) {
+                // This game's own value if it has one (currentGame is set by now), else global;
+                // the router follows it, so routing and the armed ports agree for this game.
+                val multitap = ControllerMappings.multitapEnabled()
+                com.armsx2.input.PadRouter.multitapEnabled = multitap
+                if (multitap) {
                     NativeApp.setSetting("Pad", "MultitapPort1", "bool", "true")
                     NativeApp.setSetting("Pad", "MultitapPort2", "bool", "true")
                     for (s in 2..8) {
@@ -1025,6 +1032,16 @@ open class MainActivityRuntime : ComponentActivity() {
                         NativeApp.setSetting("Pad$s", "AxisScale", "float", "1.33")
                         NativeApp.setSetting("Pad$s", "ButtonDeadzone", "float", "0")
                     }
+                } else {
+                    // Off has to be written as well. These flags live in the settings file, and
+                    // switching Multitap off with no game running never reaches the core
+                    // (setMultitap needs a VM), so a tap armed once stayed plugged in on every
+                    // later boot. A game that looks for a multitap then found one on port 1 and
+                    // took its players from there, never from port 2 where the second
+                    // controller plays: Marvel Ultimate Alliance and Sonic Riders (#586).
+                    NativeApp.setSetting("Pad", "MultitapPort1", "bool", "false")
+                    NativeApp.setSetting("Pad", "MultitapPort2", "bool", "false")
+                    for (s in 3..8) NativeApp.setSetting("Pad$s", "Type", "string", "None")
                 }
             }
 
@@ -2121,6 +2138,8 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.input.Lightgun.load()
                 com.armsx2.input.UsbDevices.applyAtBoot()
             }
+            // The Overlay tab's switch for the free-software notice at game start (#453).
+            runCatching { NativeApp.setFreeSoftwareNotice(prefs.getBoolean("ui.freeSoftwareNotice", true)) }
 
             // Pin Filenames/BIOS to the file the setup wizard copied —
             // deferred to here because Host::SetBaseStringSettingValue
@@ -3086,6 +3105,9 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The library screensaver sees every key first: any input resets its clock, and the press
+        // that wakes it goes no further, so it can't also start a game.
+        if (com.armsx2.ui.home.LibraryScreensaver.onKey(event)) return true
         // Joy-Con buttons all arrive as KEYCODE_UNKNOWN (no Android key layout for 0x057E,
         // so keyCode is always 0 — emulog-150). Rewrite to a stable scanCode-derived keycode
         // ONCE here and re-dispatch, so EVERY downstream path — bind-capture, nav, AND the
@@ -3208,6 +3230,9 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.common.PadModals.visible &&
             !com.armsx2.ui.home.LibraryKeyboard.visible.value
         ) {
+            // Except the phone's own volume keys, which are the system's with a modal up or not:
+            // swallowing them left the volume stuck while any menu or prompt was open.
+            if (isVolumeKey(kc)) return false
             val firstDown = event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0
             when (kc) {
                 KeyEvent.KEYCODE_DPAD_UP -> if (firstDown) modalNavMove(0, -1)
@@ -3313,6 +3338,8 @@ open class MainActivityRuntime : ComponentActivity() {
         // pads that report the D-pad as KEYCODE_DPAD_*. Placed before every other
         // frontend handler so nothing leaks to the grid behind it.
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
+            // The phone's volume keys stay the system's, as they are with any modal up.
+            if (isVolumeKey(kc)) return false
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3335,6 +3362,7 @@ open class MainActivityRuntime : ComponentActivity() {
         // selection, A jumps to the setting, Y re-opens the keyboard, B closes. Owns the pad so
         // nothing leaks to the settings screen behind.
         if (com.armsx2.ui.settingshub.SettingsSearch.visible.value) {
+            if (isVolumeKey(kc)) return false // the system's, as with any modal up
             if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.settingshub.SettingsSearch.move(-1)
@@ -3356,6 +3384,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // block above on purpose: naming a preset hands input to LibraryKeyboard, and it
         // must keep it until it closes.
         if (com.armsx2.ui.common.ShaderParamsEditor.visible) {
+            // The phone's volume keys stay the system's: the catch-all below swallowed them, so
+            // the volume could not be changed while the editor was open.
+            if (isVolumeKey(kc)) return false
             val editor = com.armsx2.ui.common.ShaderParamsEditor
             val down = event.action == KeyEvent.ACTION_DOWN
             when (kc) {
@@ -3627,6 +3658,10 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (down && event.repeatCount == 0) toggleGyro()
                     return true
                 }
+                ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> {
+                    if (down && event.repeatCount == 0) togglePressureModifier()
+                    return true
+                }
                 ControllerMappings.SysHotkey.GYRO_RECENTER -> {
                     if (down && event.repeatCount == 0) recenterGyro()
                     return true
@@ -3837,6 +3872,15 @@ open class MainActivityRuntime : ComponentActivity() {
         hotkeyToast(if (on) "Gyro ON" else "Gyro OFF")
     }
 
+    /** The PRESSURE_MOD_TOGGLE hotkey (#304): flips the soft-press modifier and leaves it, applied
+     *  to buttons already held just as the hold binding does. */
+    private fun togglePressureModifier() {
+        val on = !com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value
+        com.armsx2.ui.touch.TouchControls.pressureModifierHeld.value = on
+        com.armsx2.ui.touch.TouchControls.reapplyPressureToHeldButtons()
+        hotkeyToast(if (on) "Pressure modifier ON" else "Pressure modifier OFF")
+    }
+
     /** Re-zero the motion neutral. Routed through [gyroRecenterHook] because the sensor
      *  instance is owned by the touch overlay composable, not the runtime. No-op (with a
      *  toast either way) when no gyro session is live, so the binding never feels dead. */
@@ -4028,6 +4072,7 @@ open class MainActivityRuntime : ComponentActivity() {
     // on every other device — see maybeCorrectTouchScale). ALWAYS returns super, so it can never
     // block or consume a tap.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (com.armsx2.ui.home.LibraryScreensaver.onTouch(ev)) return true
         maybeCorrectTouchScale(ev)
         return super.dispatchTouchEvent(ev)
     }
@@ -4264,6 +4309,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (com.armsx2.ui.home.LibraryScreensaver.onMotion(ev)) return true
         // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
         // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
         // gameplay path would drop. Pure logging — no behaviour change.
@@ -4346,7 +4392,8 @@ open class MainActivityRuntime : ComponentActivity() {
             sendTrigger(ev, left = false, port = port)
             // Physical STICK DIRECTIONS bound to a PS2 control via the "(send)"
             // rows — e.g. R-Stick Down bound to send Square. The analog "(send)"
-            // targets contribute to the merge layer like every other writer.
+            // targets contribute to the merge layer like every other writer. A bound
+            // direction no longer drives its own stick direction too (dispatchStick).
             dispatchStickDirBindings(ev, port)
             // Single write per analog code per event, merged across ALL writers.
             flushAnalogAxes(port)
@@ -4364,6 +4411,11 @@ open class MainActivityRuntime : ComponentActivity() {
     // merge layer), thresholded for a digital one (change-tracked per code so we
     // only write edges, like dispatchDpadCombined).
     private val stickDirDigitalHeld = Array(8) { HashSet<Int>() } // per unified pad slot (multitap)
+
+    /** Whether this physical stick direction is bound to a PS2 control in Button mapping. */
+    private fun stickDirBound(left: Boolean, dir: ControllerMappings.StickDir, port: Int): Boolean =
+        ControllerMappings.targetForPhysical(ControllerMappings.stickHotkeyKeyCode(left, dir), port) != null
+
     private fun dispatchStickDirBindings(ev: MotionEvent, port: Int) {
         for (left in booleanArrayOf(true, false)) {
             // Same axis correction the main dispatch applies (swap, then inverts).
@@ -5165,7 +5217,8 @@ open class MainActivityRuntime : ComponentActivity() {
      *  user-chosen left for RE4-style games; steer -> left) so coarse stick aim
      *  and fine gyro adjustment work together instead of clobbering each other. */
     fun onGyroAnalog(mode: Int, gx: Float, gy: Float) {
-        gyroCombineLeft = mode == 2 ||
+        gyroCombineLeft =
+            (mode == 2 && ControllerMappings.gyroSteerStick() == ControllerMappings.GYRO_STICK_LEFT) ||
             (mode == 1 && ControllerMappings.gyroAimStick() == ControllerMappings.GYRO_STICK_LEFT)
         gyroVecX = gx; gyroVecY = gy
         gyroCombineActive = gx != 0f || gy != 0f
@@ -5205,6 +5258,14 @@ open class MainActivityRuntime : ComponentActivity() {
         if (ControllerMappings.stickSwapXY(leftStick)) { val t = vx; vx = vy; vy = t }
         if (ControllerMappings.stickInvertX(leftStick)) vx = -vx
         if (ControllerMappings.stickInvertY(leftStick)) vy = -vy
+        // A direction bound in Button mapping (a "(send)" row) drives only that binding, in
+        // dispatchStickDirBindings. Driving the stick's own direction as well sent both at once:
+        // swapping the right stick's left and right that way put R-Left and R-Right on the same
+        // axis together, and they cancelled out (#604).
+        if (vx < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.LEFT, port)) vx = 0f
+        if (vx > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.RIGHT, port)) vx = 0f
+        if (vy < 0f && stickDirBound(leftStick, ControllerMappings.StickDir.UP, port)) vy = 0f
+        if (vy > 0f && stickDirBound(leftStick, ControllerMappings.StickDir.DOWN, port)) vy = 0f
         when (mode) {
             ControllerMappings.StickMode.ANALOG -> {
                 // Radial shaping into the merge layer (flushAnalogAxes writes once
@@ -5333,6 +5394,7 @@ open class MainActivityRuntime : ComponentActivity() {
                 hotkeyToast(if (on) "Fast Forward ON" else "Fast Forward OFF")
             }
             ControllerMappings.SysHotkey.GYRO_TOGGLE -> toggleGyro()
+            ControllerMappings.SysHotkey.PRESSURE_MOD_TOGGLE -> togglePressureModifier()
             // GYRO_HOLD needs key up/down edges, which this edge-triggered path (stick
             // directions / combos) doesn't provide — behave as a toggle here rather than
             // latching gyro on with no release.

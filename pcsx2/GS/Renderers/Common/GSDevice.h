@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+namespace GSDriverReport
+{
+	struct BackendReport;
+}
+
 enum class Filter
 {
 	Nearest = 0,
@@ -1684,6 +1689,14 @@ protected:
 	GSVSyncMode m_vsync_mode = GSVSyncMode::Disabled;
 	bool m_allow_present_throttle = false;
 	bool m_present_has_new_frame = false;
+	struct PresentGeometry
+	{
+		GSVector4i src_rect = GSVector4i::zero(); ///< the game's visible area in GetCurrent(), texture pixels
+		GSVector4 draw_rect = GSVector4::zero();  ///< where it lands in the presentation, pixels
+		bool linear = false;                      ///< bilinear, else nearest
+		bool plain = false;                       ///< the present is nothing but that scaled blit
+	};
+	PresentGeometry m_present_geometry;
 	u64 m_last_frame_displayed_time = 0;
 
 	GSTexture* m_merge = nullptr;
@@ -1965,6 +1978,7 @@ public:
 		// Assume nothing until the frame is actually composited. Several presents legitimately
 		// carry no new game output — see NotePresentHasNewFrame.
 		m_present_has_new_frame = false;
+		m_present_geometry = {};
 		return DoBeginPresent(frame_skip);
 	}
 
@@ -1978,6 +1992,15 @@ public:
 	/// a skipped duplicate, or a boot screen with no GS output yet.
 	void NotePresentHasNewFrame() { m_present_has_new_frame = true; }
 
+	/// How that frame was drawn, recorded with NotePresentHasNewFrame, for frame generation on the
+	/// game's own image: it repeats exactly this scaled blit for each generated frame, so it only
+	/// does so when [plain] says the present was nothing more (no upscaler or sharpening pass, no
+	/// TV shader, no rotation). Otherwise frame generation keeps working on the finished screen.
+	void NotePresentGeometry(const GSVector4i& src_rect, const GSVector4& draw_rect, bool linear, bool plain)
+	{
+		m_present_geometry = {src_rect, draw_rect, linear, plain};
+	}
+
 	/// Presents the frame to the display.
 	virtual void EndPresent() = 0;
 
@@ -1986,6 +2009,10 @@ public:
 
 	/// Returns a string of information about the graphics driver being used.
 	virtual std::string GetDriverInfo() const = 0;
+
+	/// Fills this device's part of the driver report written beside a GS dump. Runs on the GS
+	/// thread. Backends that know more than the base (Vulkan, OpenGL) extend it.
+	virtual void CollectDriverReport(GSDriverReport::BackendReport& out) const;
 
 	/// Enables/disables GPU frame timing.
 	virtual bool SetGPUTimingEnabled(bool enabled) = 0;

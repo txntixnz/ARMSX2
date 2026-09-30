@@ -153,6 +153,10 @@ static MemorySettingsInterface s_settings_interface;
 static s32 s_clear_shader_cache_frame = -1;
 
 static std::string s_output_prefix;
+// -take-gsdump: a one-frame GS dump (and its driver report) written at this base path on the first
+// loop's second presented frame. Empty = off.
+static std::string s_take_gsdump_base;
+static bool s_take_gsdump_queued = false;
 static s32 s_loop_count = 1;
 static std::optional<bool> s_use_window;
 static bool s_no_console = false;
@@ -731,6 +735,14 @@ void Host::BeginPresentFrame()
 	// has to open and close.
 	RenderDocCapture::OnPresentFrame(s_dump_frame_number);
 
+	// Before the per-frame screenshot below: only one snapshot request can be pending at a time.
+	if (!s_take_gsdump_base.empty() && !s_take_gsdump_queued && s_loop_number == 0 && s_dump_frame_number >= 1)
+	{
+		s_take_gsdump_queued = GSQueueSnapshot(s_take_gsdump_base + ".png", 1);
+		if (s_take_gsdump_queued)
+			Console.WriteLn(fmt::format("Taking a GS dump at frame {} to '{}'.", s_dump_frame_number, s_take_gsdump_base));
+	}
+
 	if (s_loop_number == 0 && !s_output_prefix.empty())
 	{
 		// when we wrap around, don't race other files
@@ -840,8 +852,8 @@ void Host::BeginPresentFrame()
 			sample.gpu_ms = PerformanceMetrics::GetLastGPUTime();
 
 			// Thread CPU time, sampled here on the GS thread itself, so the frame's
-			// delta is what this thread executed between two presents. Under a
-			// GSBackThreadMode above Off the back thread carries part of the work and
+			// delta is what this thread executed between two presents. With
+			// GS multi-threading on, the back thread carries part of the work and
 			// is not sampled here; the run summary says so, because a per-draw figure
 			// taken from half the work would read as a win.
 			const u64 gs_cpu_now = MTGS::GetThreadHandle().GetCPUTime();
@@ -1131,6 +1143,9 @@ static void PrintCommandLineHelp(const char* progname)
 						 "run cannot even create an instance under it.\n");
 	std::fprintf(stderr, "  -renderdoc-frame N[,C]: Capture dump frame N (base 0, minimum 1) and the C-1 frames after it, "
 						 "one .rdc each. Defaults to 1,1. Only used if -renderdoc is used.\n");
+	std::fprintf(stderr, "  -take-gsdump <path>: write a one-frame GS dump of the replay, with its driver report, to "
+						 "<path>.gs.zst and <path>.driver.json (plus the dump's screenshot <path>.png), on the first "
+						 "loop's second frame.\n");
 	std::fprintf(stderr, "  -custom-driver <dir> <libname> <hooklibdir>: Android only. Load the Vulkan driver <libname> "
 						 "out of <dir> through libadrenotools instead of the system loader, e.g. a Mesa Turnip pack in "
 						 "/data/local/tmp. <hooklibdir> holds libhook_impl.so, libmain_hook.so and "
@@ -1170,7 +1185,7 @@ static void PrintCommandLineHelp(const char* progname)
 						 "inside render target, preload frame with GS data, respectively.\n");
 	std::fprintf(stderr, "  -ini <path>: Load the [EmuCore/GS] section of an INI file as settings overrides. Applied in "
 						 "command-line order, so a later -set wins.\n");
-	std::fprintf(stderr, "  -backthread <mode>: GS back-thread mode (0=off, 1=inline-records, 2=lockstep, 3=pipelined). Defaults to 0.\n");
+	std::fprintf(stderr, "  -backthread <0|1>: GS multi-threading off or on (3 is accepted as on). Defaults to 0.\n");
 	std::fprintf(stderr, "  -window: Forces a window to be displayed.\n");
 	std::fprintf(stderr, "  -surfaceless: Disables showing a window.\n");
 	std::fprintf(stderr, "  -logfile <filename>: Writes emu log to filename.\n");
@@ -1201,6 +1216,10 @@ static void PrintCommandLineHelp(const char* progname)
 						 "no GS device and no window -- the dump already carries the freeze and the packet stream.\n");
 	std::fprintf(stderr, "  -payload-frames <count>: Stop the emitted payload after this many dump frames. 0 (the default) "
 						 "means all of them. Only used with -emit-payload.\n");
+	std::fprintf(stderr, "  -payload-at packet,bp,bw,psm,x,y,w,h: Place one checkpoint after the named dump packet, "
+						 "reading its own region -- the render-target pages a later draw samples, or a CLUT page. "
+						 "Repeatable; each occurrence adds a checkpoint. The packet index is the one -ladder-every "
+						 "counts, so both arms name the same boundary. Only used with -emit-payload.\n");
 	std::fprintf(stderr, "  -payload-readback bp,bw,psm,w,h | bp,bw,psm,x,y,w,h: The region every payload checkpoint reads "
 						 "back. Left alone it comes from the freeze's context-0 FRAME, which is wrong for a dump that "
 						 "renders somewhere other than where it displays. Only used with -emit-payload.\n");
@@ -1210,6 +1229,9 @@ static void PrintCommandLineHelp(const char* progname)
 						 "arm the console payload is compared against. Keep the window small: a rung is only useful if "
 						 "hundreds of them fit.\n");
 	std::fprintf(stderr, "  -ladder-every <n>: Take a ladder rung every n draws. Only used if -ladder is used.\n");
+	std::fprintf(stderr, "  -ladder-at packet,bp,bw,psm,x,y,w,h: Take one rung after the named dump packet, reading its "
+						 "own region. Repeatable. Pairs with the console payload's -payload-at, which counts the same "
+						 "packets, so the two arms compare word for word.\n");
 	std::fprintf(stderr, "  -ladder-out <path>: Where to write the ladder rungs. Only used if -ladder is used.\n");
 	std::fprintf(stderr, "  -vmhash: Log a hash of GS local memory at every presented frame.\n");
 	std::fprintf(stderr, "  -stats-json <path>: Write per-frame and run-summary statistics as JSON. Combine with -perf "
@@ -1474,6 +1496,16 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				}
 				continue;
 			}
+			else if (CHECK_ARG_PARAM("-take-gsdump"))
+			{
+				s_take_gsdump_base = StringUtil::StripWhitespace(argv[++i]);
+				if (s_take_gsdump_base.empty())
+				{
+					ArgError("-take-gsdump: the path is empty.");
+					return false;
+				}
+				continue;
+			}
 			else if (CHECK_ARG_PARAM("-dumpdirhw"))
 			{
 				s_settings_interface.SetStringValue("EmuCore/GS", "HWDumpDirectory", argv[++i]);
@@ -1556,17 +1588,17 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				const std::optional<int> parsed = ParseNumericArg<int>("-backthread", mode_arg);
 				if (!parsed.has_value())
 					return false;
+				// 3 was the pipelined mode's number when the setting had four modes; older scripts pass it.
 				const int mode = parsed.value();
-				if (mode < 0 || mode > 3)
+				if (mode != 0 && mode != 1 && mode != 3)
 				{
-					ArgError("-backthread: mode '{}' is out of range (0=off, 1=inline-records, 2=lockstep, "
-							 "3=pipelined).",
+					ArgError("-backthread: '{}' is not 0 (off) or 1 (on). The inline-records and lockstep modes were removed.",
 						mode_arg);
 					return false;
 				}
 
-				Console.WriteLn("Setting GS back-thread mode to %d.", mode);
-				s_settings_interface.SetIntValue("EmuCore/GS", "GSBackThreadMode", mode);
+				Console.WriteLn("GS multi-threading %s.", mode ? "on" : "off");
+				s_settings_interface.SetIntValue("EmuCore/GS", "GSBackThreadMode", mode ? 1 : 0);
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("-swthreads"))
@@ -1916,6 +1948,31 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				s_payload_opts.frame_limit = frames.value();
 				continue;
 			}
+			else if (CHECK_ARG_PARAM("-payload-at"))
+			{
+				const std::string_view spec = StringUtil::StripWhitespace(argv[++i]);
+				std::vector<std::string_view> parts = StringUtil::SplitString(spec, ',', true);
+				if (parts.size() != 8)
+				{
+					ArgError("-payload-at: got {} fields, wants packet,bp,bw,psm,x,y,w,h.", parts.size());
+					return false;
+				}
+				u32 f[8];
+				for (size_t k = 0; k < parts.size(); k++)
+				{
+					const std::optional<u32> v = ParseNumericArg<u32>("-payload-at", parts[k]);
+					if (!v.has_value())
+						return false;
+					f[k] = v.value();
+				}
+				if (f[6] == 0 || f[7] == 0)
+				{
+					ArgError("-payload-at: a checkpoint with an empty rectangle reads nothing.");
+					return false;
+				}
+				s_payload_opts.at.push_back({f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]});
+				continue;
+			}
 			else if (CHECK_ARG_PARAM("-payload-readback"))
 			{
 				// bp,bw,psm,w,h -- the region every checkpoint reads back. Left alone it
@@ -1987,6 +2044,31 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 				s_ladder_opts.y = rung[4];
 				s_ladder_opts.w = rung[5];
 				s_ladder_opts.h = rung[6];
+				continue;
+			}
+			else if (CHECK_ARG_PARAM("-ladder-at"))
+			{
+				const std::string_view spec = StringUtil::StripWhitespace(argv[++i]);
+				std::vector<std::string_view> parts = StringUtil::SplitString(spec, ',', true);
+				if (parts.size() != 8)
+				{
+					ArgError("-ladder-at: got {} fields, wants packet,bp,bw,psm,x,y,w,h.", parts.size());
+					return false;
+				}
+				u32 f[8];
+				for (size_t k = 0; k < parts.size(); k++)
+				{
+					const std::optional<u32> v = ParseNumericArg<u32>("-ladder-at", parts[k]);
+					if (!v.has_value())
+						return false;
+					f[k] = v.value();
+				}
+				if (f[6] == 0 || f[7] == 0)
+				{
+					ArgError("-ladder-at: a rung with an empty rectangle reads nothing.");
+					return false;
+				}
+				s_ladder_opts.at.push_back({f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]});
 				continue;
 			}
 			else if (CHECK_ARG_PARAM("-ladder-every"))
@@ -2098,7 +2180,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
 	// Half a ladder is not a smaller ladder, it is a run that produces no file
 	// and exits 0. A harness diffing two arms then finds one output missing and
 	// has to work backwards to a flag it did not pass.
-	const bool ladder_rect = (s_ladder_opts.w != 0 && s_ladder_opts.h != 0);
+	const bool ladder_rect = (s_ladder_opts.w != 0 && s_ladder_opts.h != 0) || !s_ladder_opts.at.empty();
 	if (ladder_rect != !s_ladder_opts.output_path.empty())
 	{
 		ArgError("-ladder and -ladder-out go together; got only {}.",
@@ -2475,7 +2557,7 @@ void GSRunner::DumpStats()
 		Console.WriteLn(fmt::format("@HWSTAT@ Maximum Frame Time: {:.3f} ms ({:.3f} FPS)", PerformanceMetrics::GetMaximumFrameTime(), 1000.0f / PerformanceMetrics::GetMaximumFrameTime()));
 		Console.WriteLn(fmt::format("@HWSTAT@ CPU Thread Usage: {:.3f} %", s_perf_sum_cpu_thread_usage / s_perf_updates));
 		Console.WriteLn(fmt::format("@HWSTAT@ GS Thread Usage: {:.3f} %", s_perf_sum_gs_thread_usage / s_perf_updates));
-		// Only emitted under GSBackThreadMode >= Lockstep. Omitted rather than reported as a
+		// Only emitted with GS multi-threading on. Omitted rather than reported as a
 		// flat zero, so a comparison across the two configurations doesn't read as a GS win
 		// that is really work moved onto an unlisted thread.
 		if (s_perf_saw_gs_back_thread)

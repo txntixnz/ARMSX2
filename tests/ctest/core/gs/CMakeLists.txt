@@ -25,6 +25,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_stream_ring_flush_tests.cpp
 	gs_stream_ring_growth_tests.cpp
 	gs_gpu_driver_profile_tests.cpp
+	gs_driver_report_tests.cpp
 	gs_vulkan_device_rules_tests.cpp
 	gs_gpu_profile_tests.cpp
 	gs_draw_staging_tests.cpp
@@ -50,6 +51,9 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_stq_blit_tests.cpp
 	gs_sw_coordinate_field_tests.cpp
 	gs_sw_coordinate_grain_tests.cpp
+	gs_sw_sprite_ramp_tests.cpp
+	gs_sw_perspective_plane_tests.cpp
+	gs_sw_perspective_plane_scanline_tests.cpp
 	gs_sw_scanline_lod_tests.cpp
 	gs_sw_textured_block_width_tests.cpp
 	gs_sw_depth_walk_tests.cpp
