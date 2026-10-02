@@ -93,6 +93,7 @@ jobs:
               'PadLayoutStore',
               'DynamicCrosshairRuntimeState',
               'MenuControllerInputRouter',
+              'ARMSX2LogoStore',
           }
 
           def brace_delta(line: str) -> int:
