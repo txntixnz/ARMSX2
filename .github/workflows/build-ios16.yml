@@ -92,6 +92,7 @@ jobs:
               'PadLayoutPresetStore',
               'PadLayoutStore',
               'DynamicCrosshairRuntimeState',
+              'MenuControllerInputRouter',
           }
 
           def brace_delta(line: str) -> int:
