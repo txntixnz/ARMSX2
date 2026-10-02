@@ -137,6 +137,18 @@ for path in root.rglob("*.swift"):
     if count:
         counts["multiline onChange"] = counts.get("multiline onChange", 0) + count
 
+    # Some View extensions call onChange as an implicit-self method, e.g.
+    # `onChange(of: value, initial: true) { ... }`, with no leading dot.
+    # The earlier rewrite only catches chained `.onChange` calls, so these
+    # would survive until Xcode and fail the iOS 16 availability check.
+    source, count = re.subn(
+        r"(?<![A-Za-z0-9_\.])onChange\s*\(\s*of\s*:",
+        "ios16OnChange(of:",
+        source,
+    )
+    if count:
+        counts["bare onChange"] = counts.get("bare onChange", 0) + count
+
     # Map navigationDestination(item:) to iOS 16 NavigationStack compatible
     # optional-item navigation. Preserve the actual destination view.
     source, n = re.subn(r"\.navigationDestination\s*\(\s*item\s*:",
