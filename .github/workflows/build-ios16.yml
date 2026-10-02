@@ -94,6 +94,12 @@ jobs:
               'DynamicCrosshairRuntimeState',
               'MenuControllerInputRouter',
               'ARMSX2LogoStore',
+              'ThemeGalleryStore',
+              'MenuAudioPackManager',
+              'UIFrameRateSettings',
+              'GameCoverThemePreviewStore',
+              'SaveStateUndoModel',
+              'ControllerAccessibilityNavigationSession',
           }
 
           def brace_delta(line: str) -> int:
@@ -178,7 +184,15 @@ jobs:
               # Remove @Observable token/line and alter declarations.
               for ann_i, decl_i, name in targets:
                   if name not in observable_classes:
-                      raise SystemExit(f'Unexpected @Observable class {name} in {path}; inspect upstream before continuing.')
+                      # Upstream frequently adds new @Observable state owners under
+                      # Models. Apply the same iOS 16 ObservableObject backport to
+                      # these, rather than rejecting each new class by name.
+                      # Keep the guard for annotated view-layer classes, which
+                      # might need a bespoke SwiftUI adaptation.
+                      if path.relative_to(root).parts[0] != 'Models':
+                          raise SystemExit(f'Unexpected @Observable class {name} in {path}; inspect upstream before continuing.')
+                      print(f'iOS16: backport upstream model class {name} in {path}')
+                      observable_classes.add(name)
                   lines[ann_i] = lines[ann_i].replace('@Observable', '')
                   lines[decl_i] = add_observableobject_conformance(lines[decl_i], name)
                   converted.append(name)
