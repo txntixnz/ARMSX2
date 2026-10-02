@@ -42,7 +42,7 @@ if "ARMSX2_IOS16_A15_TARGET_V961" not in bp:
 
 # ---------------------------------------------------------------------------
 # 2) Graphics UI switches.
-#    - 2x presentation surface: validated performance win.
+#    - 2x presentation surface: optional cap (default ON; user can disable).
 #    - 1.75x efficiency cap: optional experiment, default OFF.
 #    - Stock CAMetalLayer drawable queue retained.
 # ---------------------------------------------------------------------------
@@ -65,16 +65,19 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
     )
     gfx = gfx.replace(state_anchor, state_block, 1)
 
-    perf_anchor = '''            Section {
-                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [
-'''
-    if gfx.count(perf_anchor) != 1:
+    # Upstream changed the Performance row from a GS Back Thread picker
+    # to a GS Multi-threading toggle. Support either layout without replacing it.
+    perf_anchor_options = (
+        '                Toggle(settings.localized("GS Multi-threading"), isOn: Binding(\n',
+        '                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [\n',
+    )
+    matched_anchors = [a for a in perf_anchor_options if gfx.count(a) == 1]
+    if len(matched_anchors) != 1:
         raise SystemExit(
-            "A15/Metal V9.6.1: Graphics Performance section anchor changed upstream."
+            "A15/Metal V9.6.3: expected one recognizable Graphics Performance row."
         )
 
-    perf_block = '''            Section {
-                Toggle(settings.localized("2× Metal Presentation Scale"), isOn: $metalPresentation2x)
+    perf_block = '''                Toggle(settings.localized("2× Metal Presentation Scale"), isOn: $metalPresentation2x)
                 Text(settings.localized("Caps only the final iOS Metal presentation surface at 2× instead of the display's native scale. PS2 internal rendering resolution is unchanged. Fully close and relaunch ARMSX2 after changing this option."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -84,9 +87,8 @@ if "// ARMSX2_IOS16_A15_METAL_UI_V961" not in gfx:
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [
 '''
-    gfx = gfx.replace(perf_anchor, perf_block, 1)
+    gfx = gfx.replace(matched_anchors[0], perf_block + matched_anchors[0], 1)
     graphics.write_text(gfx)
 
 # ---------------------------------------------------------------------------
@@ -121,8 +123,8 @@ if "// ARMSX2_IOS16_A15_METAL_NATIVE_V961" not in im:
             const BOOL use2xPresentation = storedValue ? [storedValue boolValue] : YES;
 
             // 1.75x is an optional efficiency experiment and deliberately
-            // overrides the validated 2x cap when enabled. Turning it back off
-            // returns to the exact field-proven 2x behavior.
+            // overrides the 2x cap when enabled. Turning it back off
+            // restores the previous presentation-scale selection.
             if (use175xPresentation)
                 scale = MIN(scale, (CGFloat)1.75);
             else if (use2xPresentation)
