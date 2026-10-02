@@ -822,22 +822,14 @@ jobs:
           '''
               swift = swift.replace(struct_anchor, helper + struct_anchor, 1)
 
-              settings_pat = re.compile(
-                  r'(struct\s+GamepadSettingsView\s*:\s*View\s*\{\s*\n'
-                  r'(?:[ \t]*\n)*'
-                  r'[ \t]*@(?:State|ObservedObject)\s+private\s+var\s+settings\s*=\s*SettingsStore\.shared[^\n]*\n)'
-              )
-              match = settings_pat.search(swift)
-              if not match:
-                  raise SystemExit(
-                      'GT4 trigger-pedal patch: could not locate SettingsStore.shared after the iOS 16 Observation backport.'
-                  )
-
+              # The upstream GamepadSettingsView now declares static helper methods
+              # before the settings property. Install this @AppStorage next to the
+              # view declaration rather than expecting settings to be the first line.
               storage = (
                   '\n    @AppStorage("ARMSX2_GT4TriggerPedals") '
                   'private var gt4TriggerPedals = false\n'
               )
-              swift = swift[:match.end()] + storage + swift[match.end():]
+              swift = swift.replace(struct_anchor, struct_anchor + storage, 1)
 
               rumble_pos = swift.find('ARMSX2Bridge.testControllerRumble()')
               if rumble_pos < 0:
