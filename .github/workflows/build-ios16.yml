@@ -184,14 +184,21 @@ jobs:
               # Remove @Observable token/line and alter declarations.
               for ann_i, decl_i, name in targets:
                   if name not in observable_classes:
-                      # Upstream frequently adds new @Observable state owners under
-                      # Models. Apply the same iOS 16 ObservableObject backport to
-                      # these, rather than rejecting each new class by name.
-                      # Keep the guard for annotated view-layer classes, which
-                      # might need a bespoke SwiftUI adaptation.
-                      if path.relative_to(root).parts[0] != 'Models':
-                          raise SystemExit(f'Unexpected @Observable class {name} in {path}; inspect upstream before continuing.')
-                      print(f'iOS16: backport upstream model class {name} in {path}')
+                      # Upstream adds @Observable state owners in both Models and
+                      # Views. Accept genuine annotated class declarations in the
+                      # iOS source tree without an ever-growing name allowlist.
+                      # The annotation-to-ObservableObject conversion below is
+                      # unchanged; keep rejecting suspicious/non-class matches.
+                      annotation = lines[ann_i].strip()
+                      declaration = lines[decl_i].strip()
+                      if annotation != '@Observable' or not re.match(
+                          r'^(?:(?:public|private|fileprivate|internal|open|final|@MainActor)\\s+)*class\\s+'
+                          + re.escape(name) + r'\\b', declaration
+                      ):
+                          raise SystemExit(
+                              f'iOS16: unsupported @Observable declaration for {name} in {path}'
+                          )
+                      print(f'iOS16: backport upstream observable class {name} in {path}')
                       observable_classes.add(name)
                   lines[ann_i] = lines[ann_i].replace('@Observable', '')
                   lines[decl_i] = add_observableobject_conformance(lines[decl_i], name)
