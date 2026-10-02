@@ -2,6 +2,9 @@ name: Build ARMSX2 for iOS 16 (v9.6.4 A15 GS pass coalescing test)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ios16-v965-compat-ci-20261002
 
 permissions:
   contents: read
