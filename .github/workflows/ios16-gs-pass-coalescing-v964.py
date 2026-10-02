@@ -45,14 +45,29 @@ if marker not in ss:
         1,
     )
 
+    # New upstream split resetGraphicsDefaults into SettingsStore+Defaults.swift.
+    # Patch the real reset owner, not whichever file happened to own it before.
     reset_anchor = '        hardwareMipmapping = true\n'
-    if ss.count(reset_anchor) != 1:
-        raise SystemExit("GS pass coalescing V9.6.4: graphics reset anchor changed upstream.")
-    ss = ss.replace(
-        reset_anchor,
-        '        coalesceRenderPasses = false\n' + reset_anchor,
-        1,
+    reset_paths = (
+        settings_store,
+        Path("platforms/ios/app/src/main/swift/Models/SettingsStore+Defaults.swift"),
     )
+    reset_owners = [
+        p for p in reset_paths if p.is_file() and p.read_text().count(reset_anchor) == 1
+    ]
+    if len(reset_owners) != 1:
+        raise SystemExit(
+            "GS pass coalescing V9.6.4: expected one graphics reset owner."
+        )
+    reset_path = reset_owners[0]
+    reset_text = reset_path.read_text()
+    if 'coalesceRenderPasses = false\n' not in reset_text:
+        reset_text = reset_text.replace(
+            reset_anchor,
+            '        coalesceRenderPasses = false\n' + reset_anchor,
+            1,
+        )
+        reset_path.write_text(reset_text)
 
     settings_store.write_text(ss)
 
@@ -60,9 +75,17 @@ gfx = graphics.read_text()
 ui_marker = "// ARMSX2_IOS16_GS_PASS_COALESCING_UI_V964"
 
 if ui_marker not in gfx:
-    picker_anchor = '                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [\n'
-    if gfx.count(picker_anchor) != 1:
-        raise SystemExit("GS pass coalescing V9.6.4: GS Back Thread picker anchor changed upstream.")
+    # Upstream replaced the GS Back Thread picker with a GS Multi-threading
+    # toggle. Either control may be present depending on the sync revision.
+    picker_options = (
+        '                Toggle(settings.localized("GS Multi-threading"), isOn: Binding(\n',
+        '                intPicker("GS Back Thread", selection: $settings.backThreadMode, options: [\n',
+    )
+    candidates = [a for a in picker_options if gfx.count(a) == 1]
+    if len(candidates) != 1:
+        raise SystemExit(
+            "GS pass coalescing V9.6.4: expected one recognizable Performance row."
+        )
 
     ui_block = (
         f"                {ui_marker}\n"
@@ -71,7 +94,7 @@ if ui_marker not in gfx:
         '                    .font(.caption)\n'
         '                    .foregroundStyle(.secondary)\n\n'
     )
-    gfx = gfx.replace(picker_anchor, ui_block + picker_anchor, 1)
+    gfx = gfx.replace(candidates[0], ui_block + candidates[0], 1)
     graphics.write_text(gfx)
 
 print("GS render-pass coalescing V9.6.4 patch applied successfully.")
