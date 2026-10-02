@@ -545,6 +545,15 @@ jobs:
           PY
 
 
+      - name: Backport new upstream SwiftUI features to iOS 16 (V9.6.5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/ios16-swiftui-upstream-compat-v965.py
+          grep -q 'ARMSX2_IOS16_INITIAL_ONCHANGE_V965' \
+            platforms/ios/app/src/main/swift/Views/IOS16Compatibility.swift
+          echo 'New upstream SwiftUI compatibility rewrites: OK'
+
       - name: Resolve FFmpeg headers for updated PCSX2 core
         shell: bash
         run: |
