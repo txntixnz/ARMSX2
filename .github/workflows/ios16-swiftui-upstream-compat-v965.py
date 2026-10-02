@@ -181,6 +181,32 @@ for path in root.rglob("*.swift"):
             "theme animation")
         counts["iOS17 custom animation"] = 1
 
+    if path.name == "GameListView.swift":
+        # This listener grew many onChange overloads in the new upstream.
+        # Split its view-builder chain to avoid pathological iOS 16 type
+        # inference on one very long generic expression.
+        start = (
+            "private struct GameLibraryControllerCommandListener: View {"
+        )
+        if start in source:
+            before, listener = source.split(start, 1)
+            old_head = (
+                "    var body: some View {\n"
+                "        Color.clear\n"
+            )
+            old_tail = (
+                "            .ios16OnChange(of: controllerInput?.navigationZone, initial: true)"
+            )
+            if listener.count(old_head) != 1 or listener.count(old_tail) != 1:
+                raise SystemExit("V9.6.5: GameLibraryControllerCommandListener layout changed")
+            listener = listener.replace(
+                old_head,
+                "    var body: some View {\n        let listenerBase = Color.clear\n", 1
+            )
+            listener = listener.replace(old_tail, "        return listenerBase\n" + old_tail, 1)
+            source = before + start + listener
+            counts["split GameList listener chain"] = 1
+
     if path.name == "MenuControllerInputRouter.swift":
         # Observation backport's line-only property parser sees the opening '{'
         # of this multiline *computed* property too late and wrongly adds Published.
