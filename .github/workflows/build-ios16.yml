@@ -192,8 +192,8 @@ jobs:
                       annotation = lines[ann_i].strip()
                       declaration = lines[decl_i].strip()
                       if annotation != '@Observable' or not re.match(
-                          r'^(?:(?:public|private|fileprivate|internal|open|final|@MainActor)\\s+)*class\\s+'
-                          + re.escape(name) + r'\\b', declaration
+                          r'^(?:(?:public|private|fileprivate|internal|open|final|@MainActor)\s+)*class\s+'
+                          + re.escape(name) + r'\b', declaration
                       ):
                           raise SystemExit(
                               f'iOS16: unsupported @Observable declaration for {name} in {path}'
