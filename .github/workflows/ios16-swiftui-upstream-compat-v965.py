@@ -99,6 +99,31 @@ extension View {
 """
     helper.write_text(h)
 
+# Navigation destination by optional item arrived in iOS 17; on iOS 16 the
+# same NavigationStack destination can be presented with an isPresented binding.
+h = helper.read_text()
+navigation_marker = "// ARMSX2_IOS16_ITEM_NAV_DEST_V965"
+if navigation_marker not in h:
+    h += """
+// ARMSX2_IOS16_ITEM_NAV_DEST_V965
+extension View {
+    func ios16NavigationDestination<Item: Identifiable, Destination: View>(
+        item: Binding<Item?>,
+        @ViewBuilder destination: @escaping (Item) -> Destination
+    ) -> some View {
+        navigationDestination(isPresented: Binding(
+            get: { item.wrappedValue != nil },
+            set: { if !$0 { item.wrappedValue = nil } }
+        )) {
+            if let selected = item.wrappedValue {
+                destination(selected)
+            }
+        }
+    }
+}
+"""
+    helper.write_text(h)
+
 counts = {}
 for path in root.rglob("*.swift"):
     if path == helper:
@@ -111,6 +136,13 @@ for path in root.rglob("*.swift"):
     source, count = re.subn(r"\.onChange\s*\(\s*of\s*:", ".ios16OnChange(of:", source)
     if count:
         counts["multiline onChange"] = counts.get("multiline onChange", 0) + count
+
+    # Map navigationDestination(item:) to iOS 16 NavigationStack compatible
+    # optional-item navigation. Preserve the actual destination view.
+    source, n = re.subn(r"\.navigationDestination\s*\(\s*item\s*:",
+                        ".ios16NavigationDestination(item:", source)
+    if n:
+        counts["item navigation destination"] = counts.get("item navigation destination", 0) + n
 
     # iOS 17 presentation/focus modifiers are nonessential to gameplay and
     # fail deployment availability checks on iOS 16.
