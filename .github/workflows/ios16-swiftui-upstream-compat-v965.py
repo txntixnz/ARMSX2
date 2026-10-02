@@ -197,7 +197,7 @@ for path in root.rglob("*.swift"):
             old_tail = (
                 "            .ios16OnChange(of: controllerInput?.navigationZone, initial: true)"
             )
-            if listener.count(old_head) != 1 or listener.count(old_tail) != 1:
+            if old_head not in listener or old_tail not in listener:
                 raise SystemExit("V9.6.5: GameLibraryControllerCommandListener layout changed")
             listener = listener.replace(
                 old_head,
